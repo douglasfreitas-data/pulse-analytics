@@ -3,6 +3,8 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <SPIFFS.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
 
 /*
  * ============================================
@@ -32,6 +34,23 @@ const byte RATE_SIZE = 4;
 byte rates[RATE_SIZE];
 byte rateSpot = 0;
 int beatAvg = 0;
+
+// Data Science Buffers (1 min @ 200Hz = 12,000 samples)
+// ESP32-S3 has enough RAM for this.
+const int BUFFER_SIZE = 12000; 
+uint16_t irBuffer[BUFFER_SIZE];
+uint16_t redBuffer[BUFFER_SIZE];
+uint16_t greenBuffer[BUFFER_SIZE];
+int bufferIndex = 0;
+
+// ============================================
+// WIFI CONFIG
+// ============================================
+const char* WIFI_SSID = "SEU_WIFI_AQUI";
+const char* WIFI_PASS = "SUA_SENHA_AQUI";
+const char* SUPABASE_URL = "https://SEU_PROJETO.supabase.co/rest/v1/hrv_sessions";
+const char* SUPABASE_KEY = "SUA_API_KEY_ANON";
+
 
 // RR Intervals
 const int MAX_RR = 300;
@@ -106,6 +125,56 @@ bool rrAvgFull = false;
 // FUNÇÕES DE LOGGING
 // ============================================
 
+// ============================================
+// WIFI & UPLOAD
+// ============================================
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  Serial.print("Conectando WiFi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  int infoCount = 0;
+  while (WiFi.status() != WL_CONNECTED && infoCount < 10) {
+    delay(500);
+    Serial.print(".");
+    infoCount++;
+  }
+  if (WiFi.status() == WL_CONNECTED) Serial.println(" OK!");
+  else Serial.println(" Falha (Offline)");
+}
+
+void uploadSession(HRVSession *s) {
+  connectWiFi();
+  if (WiFi.status() != WL_CONNECTED) return;
+  
+  HTTPClient http;
+  http.begin(SUPABASE_URL);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+  http.addHeader("Prefer", "return=minimal");
+
+  // TODO: Enviar arrays gigantes requer streaming. 
+  // Por enquanto, enviamos apenas as métricas para validar a conexão.
+  String json = "{";
+  json += "\"session_index\": " + String(s->session) + ",";
+  json += "\"timestamp_device_min\": " + String(s->timestamp) + ",";
+  json += "\"fc_mean\": " + String(s->fc, 1) + ",";
+  json += "\"sdnn\": " + String(s->sdnn, 1) + ",";
+  json += "\"rmssd\": " + String(s->rmssd, 1) + ",";
+  json += "\"pnn50\": " + String(s->pnn50, 1) + ",";
+  json += "\"rr_valid_count\": " + String(s->rrValid);
+  json += "}";
+
+  int httpResponseCode = http.POST(json);
+  
+  if (httpResponseCode > 0) {
+    Serial.print("Supabase Upload: "); Serial.println(httpResponseCode);
+  } else {
+    Serial.print("Error on sending POST: "); Serial.println(httpResponseCode);
+  }
+  http.end();
+}
+
 void initSPIFFS() {
   if (!SPIFFS.begin(true)) {
     Serial.println("Erro ao montar SPIFFS!");
@@ -156,6 +225,9 @@ void saveSession(HRVSession& session) {
     file.close();
     
     Serial.println("Sessao salva no log!");
+    
+    // Tentar upload
+    uploadSession(&session);
   } else {
     Serial.println("Erro ao salvar sessao!");
   }
@@ -275,7 +347,7 @@ void setup() {
   bootTime = millis();
   
   Serial.println("\n============================================");
-  Serial.println("   HRV MONITOR v5.0 - COM DATA LOGGING");
+  Serial.println("   HRV MONITOR v6.0 - DATA SCIENCE (3-CH)");
   Serial.println("============================================");
   Serial.println("Comandos Serial:");
   Serial.println("  'l' - Ver log de sessoes");
@@ -310,17 +382,18 @@ void setup() {
     while (1);
   }
   
-  byte ledBrightness = 25;
-  byte sampleAverage = 1;
-  byte ledMode = 2;
-  byte sampleRate = 400;
-  int pulseWidth = 411;
-  int adcRange = 4096;
+  // MAX30105 Configuration for Data Science (High Fidelity)
+  byte ledBrightness = 0x1F; // 31 (0-255) - Adjust based on signal strength
+  byte sampleAverage = 1;    // No averaging for raw data
+  byte ledMode = 3;          // 3 = Red + IR + Green (Essential for motion correction)
+  byte sampleRate = 200;     // 200Hz - Balanced for 3 channels on ESP32
+  int pulseWidth = 411;      // 411us = 18-bit resolution
+  int adcRange = 16384;      // 14-bit range
   
   particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
   
   currentState = IDLE;
-  Serial.println("Sistema pronto!");
+  Serial.println("Sistema pronto! Config: 3-Canais @ 200Hz");
 }
 
 // ============================================
@@ -394,6 +467,7 @@ void handleCountdown() {
     currentState = MEASURING;
     sampleStartTime = millis();
     lastBeatUS = micros();
+    bufferIndex = 0; // Reset buffer for new session
     
     sessionNumber++;
     Serial.print("\n=== Sessao #");
@@ -407,6 +481,16 @@ void handleMeasurement() {
   unsigned long elapsedMS = millis() - sampleStartTime;
   
   uint32_t irValue = particleSensor.getIR();
+  uint32_t redValue = particleSensor.getRed();
+  uint32_t greenValue = particleSensor.getGreen();
+
+  // Store raw data for Batch Upload (Data Science)
+  if (bufferIndex < BUFFER_SIZE) {
+    irBuffer[bufferIndex] = (uint16_t)irValue;
+    redBuffer[bufferIndex] = (uint16_t)redValue;
+    greenBuffer[bufferIndex] = (uint16_t)greenValue;
+    bufferIndex++;
+  }
   
   if (irValue < FINGER_THRESHOLD) {
     currentState = IDLE;
