@@ -1,0 +1,657 @@
+#include <Wire.h>
+#include <MAX30105.h>
+#include <heartRate.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// OLED Display (GPIO 8 = SDA, GPIO 9 = SCL)
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// MAX30102
+MAX30105 particleSensor;
+
+// HRV Variables
+const byte RATE_SIZE = 4;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+long lastBeat = 0;
+long currentTime = 0;
+float beatsPerMinute = 0;
+int beatAvg = 0;
+
+// RR Intervals (milissegundos entre batimentos)
+const int MAX_RR = 200;
+long rrIntervals[MAX_RR];
+int rrCount = 0;
+unsigned long sampleStartTime = 0;
+const unsigned long SAMPLE_DURATION = 60000; // 60 segundos
+
+// HRV Metrics
+float rmssd = 0;
+float sdnn = 0;
+float pnn50 = 0;
+
+// States
+enum DeviceState {
+  IDLE,
+  WAITING_FOR_FINGER,
+  COUNTDOWN,
+  MEASURING,
+  PROCESSING,
+  RESULTS
+};
+
+DeviceState currentState = IDLE;
+
+// Finger detection
+const long FINGER_THRESHOLD = 50000;
+unsigned long fingerDetectedTime = 0;
+bool fingerOnSensor = false;
+const unsigned long FINGER_STABLE_TIME = 1000;
+
+// Countdown
+unsigned long countdownStart = 0;
+const unsigned long COUNTDOWN_DURATION = 5000;
+
+// ========================================
+// NOVO: Variáveis para detecção de pico melhorada
+// ========================================
+const int DC_FILTER_SIZE = 20;  // Janela para remover DC
+long irBuffer[DC_FILTER_SIZE];
+int irBufferIndex = 0;
+bool irBufferFull = false;
+
+// Variáveis de threshold adaptativo com reset
+uint32_t irMin = 0;
+uint32_t irMax = 0;
+uint32_t lastIR = 0;
+bool wasLow = false;
+
+// Filtro de média móvel para RR válidos
+const int RR_AVG_SIZE = 5;
+long rrAvgBuffer[RR_AVG_SIZE];
+int rrAvgIndex = 0;
+bool rrAvgFull = false;
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);  // Aguardar inicialização USB
+  
+  Serial.println("\n\n=== Sistema HRV Iniciando ===");
+  
+  // Initialize OLED
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 allocation failed");
+    while(1);
+  }
+  
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 20);
+  display.println("HRV MONITOR");
+  display.setTextSize(1);
+  display.setCursor(0, 45);
+  display.println("Inicializando sensores...");
+  display.display();
+  delay(2000);
+  
+  // Initialize MAX30102
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30102 not found!");
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 20);
+    display.println("ERRO: Sensor nao encontrado");
+    display.setCursor(0, 35);
+    display.println("Verifique conexoes I2C:");
+    display.setCursor(0, 45);
+    display.println("SDA = GPIO 8");
+    display.setCursor(0, 55);
+    display.println("SCL = GPIO 9");
+    display.display();
+    while(1);
+  }
+  
+  // Configure MAX30102 - OTIMIZADO
+  byte ledBrightness = 30;   // Aumentado para sinal mais forte
+  byte sampleAverage = 4;    // Média de 4 samples para reduzir ruído
+  byte ledMode = 2;          // Red + IR
+  byte sampleRate = 100;     // Reduzido - 100Hz é suficiente e mais estável
+  int pulseWidth = 411;
+  int adcRange = 4096;
+  
+  particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+  
+  // Habilitar temperatura interna (pode ajudar estabilidade)
+  particleSensor.enableDIETEMPRDY();
+  
+  currentState = IDLE;
+  Serial.println("Sistema pronto!");
+  showIdleScreen();
+}
+
+void loop() {
+  switch(currentState) {
+    case IDLE:
+      handleIDLE();
+      break;
+    
+    case WAITING_FOR_FINGER:
+      handleWaitingForFinger();
+      break;
+    
+    case COUNTDOWN:
+      handleCountdown();
+      break;
+    
+    case MEASURING:
+      measureHRV();
+      break;
+    
+    case PROCESSING:
+      calculateMetrics();
+      currentState = RESULTS;
+      break;
+    
+    case RESULTS:
+      showResultsScreen();
+      delay(10000);
+      currentState = IDLE;
+      break;
+  }
+  
+  delay(10);  // Reduzido para melhor responsividade
+}
+
+void handleIDLE() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(15, 5);
+  display.println("HRV MONITOR");
+  
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 35);
+  display.println("Coloque o dedo");
+  display.setCursor(0, 45);
+  display.println("no sensor para medir");
+  
+  display.display();
+  
+  // Verificar se dedo foi colocado
+  uint32_t irValue = particleSensor.getIR();
+  if (irValue > FINGER_THRESHOLD) {
+    if (fingerDetectedTime == 0) {
+      fingerDetectedTime = millis();
+      Serial.println("Dedo detectado...");
+    }
+    
+    if (millis() - fingerDetectedTime > FINGER_STABLE_TIME) {
+      fingerOnSensor = true;
+      currentState = COUNTDOWN;
+      countdownStart = millis();
+      Serial.println("Dedo confirmado. Iniciando countdown...");
+    }
+  } else {
+    fingerDetectedTime = 0;
+    fingerOnSensor = false;
+  }
+}
+
+void handleWaitingForFinger() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 20);
+  display.println("Aguardando dedo...");
+  display.display();
+}
+
+void handleCountdown() {
+  uint32_t irValue = particleSensor.getIR();
+  unsigned long elapsed = millis() - countdownStart;
+  
+  // Verificar se dedo saiu
+  if (irValue < FINGER_THRESHOLD) {
+    currentState = IDLE;
+    fingerOnSensor = false;
+    fingerDetectedTime = 0;
+    Serial.println("Dedo removido. Voltando para IDLE.");
+    return;
+  }
+  
+  // Mostrar countdown
+  int secondsLeft = 5 - (elapsed / 1000);
+  
+  display.clearDisplay();
+  display.setTextSize(3);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(40, 15);
+  display.println(secondsLeft);
+  
+  display.setTextSize(1);
+  display.setCursor(0, 50);
+  display.println("Mantenha o dedo firme");
+  
+  display.display();
+  
+  // Iniciar medicao apos 5 segundos
+  if (elapsed >= COUNTDOWN_DURATION) {
+    startMeasurement();
+  }
+}
+
+// ========================================
+// NOVO: Reset completo das variáveis de detecção
+// ========================================
+void resetDetectionVariables() {
+  // Reset buffers
+  for (int i = 0; i < DC_FILTER_SIZE; i++) {
+    irBuffer[i] = 0;
+  }
+  irBufferIndex = 0;
+  irBufferFull = false;
+  
+  // Reset threshold adaptativo
+  irMin = 0;
+  irMax = 0;
+  lastIR = 0;
+  wasLow = false;
+  
+  // Reset média móvel RR
+  for (int i = 0; i < RR_AVG_SIZE; i++) {
+    rrAvgBuffer[i] = 0;
+  }
+  rrAvgIndex = 0;
+  rrAvgFull = false;
+  
+  // Reset rates
+  for (int i = 0; i < RATE_SIZE; i++) {
+    rates[i] = 0;
+  }
+  rateSpot = 0;
+  beatAvg = 0;
+}
+
+void startMeasurement() {
+  // CRÍTICO: Reset completo antes de medir
+  resetDetectionVariables();
+  
+  // Limpar buffer de dados antes de medir
+  particleSensor.clearFIFO();
+  delay(100);  // Dar tempo para estabilizar
+  
+  currentState = MEASURING;
+  rrCount = 0;
+  sampleStartTime = millis();
+  lastBeat = 0;
+  
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 0);
+  display.println("MEDINDO");
+  display.setTextSize(1);
+  display.setCursor(0, 30);
+  display.println("Mantenha o dedo");
+  display.setCursor(0, 40);
+  display.println("no sensor");
+  display.display();
+  
+  Serial.println("\n=== Iniciando medicao de HRV ===");
+  Serial.println("Aguardando estabilizacao...");
+}
+
+// ========================================
+// NOVO: Calcula média móvel dos últimos RR válidos
+// ========================================
+long getAverageRR() {
+  if (!rrAvgFull && rrAvgIndex == 0) return 0;
+  
+  int count = rrAvgFull ? RR_AVG_SIZE : rrAvgIndex;
+  long sum = 0;
+  for (int i = 0; i < count; i++) {
+    sum += rrAvgBuffer[i];
+  }
+  return sum / count;
+}
+
+void addToRRAverage(long rr) {
+  rrAvgBuffer[rrAvgIndex] = rr;
+  rrAvgIndex = (rrAvgIndex + 1) % RR_AVG_SIZE;
+  if (rrAvgIndex == 0) rrAvgFull = true;
+}
+
+// ========================================
+// NOVO: Valida intervalo RR com múltiplos critérios
+// ========================================
+bool isValidRR(long newRR, long lastRR) {
+  // Critério 1: Range fisiológico (30-200 BPM)
+  if (newRR < 300 || newRR > 2000) {
+    Serial.print("[REJEITADO] Fora do range: ");
+    Serial.println(newRR);
+    return false;
+  }
+  
+  // Critério 2: Variação máxima em relação ao anterior (35%)
+  if (lastRR > 0) {
+    float variation = abs((float)newRR - lastRR) / lastRR;
+    if (variation > 0.35) {
+      Serial.print("[REJEITADO] Variacao de ");
+      Serial.print(variation * 100);
+      Serial.print("% | RR: ");
+      Serial.print(newRR);
+      Serial.print(" | LastRR: ");
+      Serial.println(lastRR);
+      return false;
+    }
+  }
+  
+  // Critério 3: Variação em relação à média móvel (40%)
+  long avgRR = getAverageRR();
+  if (avgRR > 0) {
+    float variationFromAvg = abs((float)newRR - avgRR) / avgRR;
+    if (variationFromAvg > 0.40) {
+      Serial.print("[REJEITADO] Distante da media: ");
+      Serial.print(newRR);
+      Serial.print(" vs avg ");
+      Serial.println(avgRR);
+      return false;
+    }
+  }
+  
+  return true;
+}
+
+void measureHRV() {
+  currentTime = millis();
+  long elapsedTime = currentTime - sampleStartTime;
+  
+  uint32_t irValue = particleSensor.getIR();
+  uint32_t redValue = particleSensor.getRed();
+  
+  // Período de warmup (primeiros 2 segundos para calibrar)
+  if (elapsedTime < 2000) {
+    // Calibrar min/max durante warmup
+    if (irMin == 0 || irValue < irMin) irMin = irValue;
+    if (irValue > irMax) irMax = irValue;
+    
+    static int warmupCount = 0;
+    if (warmupCount++ % 50 == 0) {
+      Serial.print("[WARMUP] IR: ");
+      Serial.print(irValue);
+      Serial.print(" | Min: ");
+      Serial.print(irMin);
+      Serial.print(" | Max: ");
+      Serial.println(irMax);
+    }
+    
+    // Atualizar display durante warmup
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 20);
+    display.println("Calibrando sensor...");
+    display.setCursor(0, 35);
+    display.print("IR: ");
+    display.println(irValue);
+    display.display();
+    
+    lastIR = irValue;
+    return;
+  }
+  
+  // Debug: mostrar valores brutos a cada 10 amostras
+  static int debugCount = 0;
+  if (debugCount++ % 10 == 0) {
+    Serial.print("Time: ");
+    Serial.print(elapsedTime/1000);
+    Serial.print("s | IR: ");
+    Serial.print(irValue);
+    Serial.print(" | RED: ");
+    Serial.print(redValue);
+    Serial.print(" | Beats: ");
+    Serial.print(rrCount);
+    Serial.print(" | Thr: ");
+    Serial.println((irMin + irMax) / 2);
+  }
+  
+  // Verificar se dedo saiu durante medicao
+  if (irValue < FINGER_THRESHOLD) {
+    currentState = IDLE;
+    fingerOnSensor = false;
+    fingerDetectedTime = 0;
+    Serial.println("Dedo removido durante medicao! Abortando.");
+    return;
+  }
+
+  // ========================================
+  // NOVO: Threshold adaptativo com decaimento
+  // ========================================
+  // Atualizar min/max com decaimento mais rápido para acompanhar drift
+  const float DECAY_FACTOR = 0.005;  // 0.5% por iteração (5x mais rápido)
+  
+  if (irValue < irMin) {
+    irMin = irValue;
+  } else {
+    // Decaimento lento do mínimo (sobe)
+    irMin = irMin + (uint32_t)((irMax - irMin) * DECAY_FACTOR);
+  }
+  
+  if (irValue > irMax) {
+    irMax = irValue;
+  } else {
+    // Decaimento lento do máximo (desce)
+    irMax = irMax - (uint32_t)((irMax - irMin) * DECAY_FACTOR);
+  }
+  
+  // Garantir range mínimo significativo
+  if (irMax - irMin < 500) {
+    // Range muito pequeno, expandir
+    irMax = irValue + 500;
+    irMin = irValue - 500;
+  }
+  
+  uint32_t threshold = (irMin + irMax) / 2;
+  
+  // Detectar transição baixo -> alto (batimento)
+  if (lastIR < threshold && irValue >= threshold && wasLow) {
+    long delta = currentTime - lastBeat;
+    
+    // Usar lastRR do buffer para validação
+    long lastRR = (rrCount > 0) ? rrIntervals[rrCount - 1] : 0;
+    
+    if (isValidRR(delta, lastRR) && rrCount < MAX_RR) {
+      rrIntervals[rrCount] = delta;
+      rrCount++;
+      
+      // Adicionar à média móvel
+      addToRRAverage(delta);
+      
+      beatsPerMinute = 60000.0 / delta;
+      rates[rateSpot++] = (byte)beatsPerMinute;
+      rateSpot %= RATE_SIZE;
+      
+      beatAvg = 0;
+      for (byte x = 0 ; x < RATE_SIZE ; x++)
+        beatAvg += rates[x];
+      beatAvg /= RATE_SIZE;
+      
+      Serial.print("[BEAT] Time: ");
+      Serial.print(elapsedTime/1000);
+      Serial.print("s | RR: ");
+      Serial.print(delta);
+      Serial.print("ms | BPM: ");
+      Serial.print((int)beatsPerMinute);
+      Serial.print(" | Avg: ");
+      Serial.print(beatAvg);
+      Serial.print(" | IR: ");
+      Serial.println(irValue);
+    }
+    
+    lastBeat = currentTime;
+  }
+  
+  // Rastrear se passou por baixo
+  wasLow = (irValue < threshold);
+  lastIR = irValue;
+  
+  // Update display
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(20, 0);
+  display.print(beatAvg);
+  display.setTextSize(1);
+  display.setCursor(90, 5);
+  display.println("BPM");
+  
+  display.setTextSize(1);
+  display.setCursor(0, 15);
+  display.print("IR:");
+  display.print(irValue/1000);
+  display.print("k");
+  
+  display.setCursor(0, 25);
+  display.print("Beats: ");
+  display.println(rrCount);
+  
+  int progress = (elapsedTime * 128) / SAMPLE_DURATION;
+  display.drawRect(0, 40, 128, 8, SSD1306_WHITE);
+  display.fillRect(0, 40, progress, 8, SSD1306_WHITE);
+  
+  display.setTextSize(1);
+  display.setCursor(0, 55);
+  display.print((SAMPLE_DURATION - elapsedTime) / 1000);
+  display.println("s");
+  
+  display.display();
+  
+  // Finalizar quando tempo acabar E tiver batimentos suficientes
+  if (elapsedTime >= SAMPLE_DURATION) {
+    if (rrCount >= 20) {  // Reduzido de 30 para 20
+      currentState = PROCESSING;
+      Serial.println("\nMedicao concluida!");
+    } else {
+      Serial.println("\nPoucos batimentos detectados. Tente novamente.");
+      currentState = IDLE;
+    }
+  }
+  
+  delay(5);  // Reduzido para mais amostras
+}
+
+void calculateMetrics() {
+  if (rrCount < 5) {
+    Serial.println("Dados insuficientes");
+    return;
+  }
+  
+  // SDNN
+  float mean = 0;
+  for (int i = 0; i < rrCount; i++) {
+    mean += rrIntervals[i];
+  }
+  mean /= rrCount;
+  
+  float variance = 0;
+  for (int i = 0; i < rrCount; i++) {
+    variance += pow(rrIntervals[i] - mean, 2);
+  }
+  variance /= rrCount;
+  sdnn = sqrt(variance);
+  
+  // RMSSD
+  float sumSquares = 0;
+  for (int i = 0; i < rrCount - 1; i++) {
+    long diff = rrIntervals[i + 1] - rrIntervals[i];
+    sumSquares += pow(diff, 2);
+  }
+  rmssd = sqrt(sumSquares / (rrCount - 1));
+  
+  // pNN50
+  int nn50Count = 0;
+  for (int i = 0; i < rrCount - 1; i++) {
+    if (abs(rrIntervals[i + 1] - rrIntervals[i]) > 50) {
+      nn50Count++;
+    }
+  }
+  pnn50 = (nn50Count * 100.0) / (rrCount - 1);
+  
+  // FC Media calculada dos RR
+  float avgRR = mean;
+  int fcMedia = (int)(60000.0 / avgRR);
+  
+  Serial.println("\n=== METRICAS HRV ===");
+  Serial.print("SDNN: ");
+  Serial.print(sdnn, 2);
+  Serial.println(" ms");
+  Serial.print("RMSSD: ");
+  Serial.print(rmssd, 2);
+  Serial.println(" ms");
+  Serial.print("pNN50: ");
+  Serial.print(pnn50, 2);
+  Serial.println(" %");
+  Serial.print("FC Media: ");
+  Serial.print(fcMedia);
+  Serial.println(" BPM");
+  Serial.print("Total RR: ");
+  Serial.println(rrCount);
+  
+  // Atualizar beatAvg com valor calculado
+  beatAvg = fcMedia;
+}
+
+void showIdleScreen() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(15, 5);
+  display.println("HRV MONITOR");
+  
+  display.setTextSize(1);
+  display.setCursor(0, 35);
+  display.println("Coloque o dedo");
+  display.setCursor(0, 45);
+  display.println("no sensor para medir");
+  
+  display.display();
+}
+
+void showResultsScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("=== RESULTADOS HRV ===");
+  
+  display.setCursor(0, 15);
+  display.print("FC: ");
+  display.print(beatAvg);
+  display.println(" BPM");
+  
+  display.setCursor(0, 25);
+  display.print("SDNN: ");
+  display.print((int)sdnn);
+  display.println(" ms");
+  
+  display.setCursor(0, 35);
+  display.print("RMSSD: ");
+  display.print((int)rmssd);
+  display.println(" ms");
+  
+  display.setCursor(0, 45);
+  display.print("pNN50: ");
+  display.print((int)pnn50);
+  display.println(" %");
+  
+  display.setCursor(0, 55);
+  display.print("Batimentos: ");
+  display.println(rrCount);
+  
+  display.display();
+}

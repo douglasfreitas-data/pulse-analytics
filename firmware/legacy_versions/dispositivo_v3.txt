@@ -1,0 +1,1114 @@
+#include <Wire.h>
+#include <MAX30105.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+/*
+ * ============================================
+ * HRV MONITOR v3.0 - MAXIMUM PRECISION
+ * ============================================
+ * 
+ * Otimizações para máxima precisão:
+ * 1. Sample rate 400Hz (máximo do sensor)
+ * 2. ADC 18-bit (262144 níveis)
+ * 3. Pan-Tompkins adaptado para PPG
+ * 4. Interpolação parabólica sub-sample
+ * 5. Detecção de artefatos de movimento
+ * 6. SpO2 calculation (bônus)
+ * 
+ * Autor: Desenvolvido para calibração de referência
+ */
+
+// ============================================
+// CONFIGURAÇÃO DE HARDWARE
+// ============================================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+MAX30105 particleSensor;
+
+// ============================================
+// CONFIGURAÇÕES DE MÁXIMA PRECISÃO
+// ============================================
+
+// Sample rate - Máximo 400 Hz interno, subamostrado para 100Hz para processamento
+const int INTERNAL_SAMPLE_RATE = 400;  // Hz - taxa interna do sensor
+const int PROCESSING_RATE = 100;       // Hz - taxa de processamento
+const int DOWNSAMPLE_FACTOR = INTERNAL_SAMPLE_RATE / PROCESSING_RATE;  // 4:1
+const float SAMPLE_PERIOD_US = 1000000.0 / PROCESSING_RATE;  // 10000 µs = 10ms
+
+// Buffer circular grande para análise
+const int BUFFER_SIZE = 512;           // ~5 segundos @ 100Hz
+float irBuffer[BUFFER_SIZE];
+float redBuffer[BUFFER_SIZE];
+float filteredBuffer[BUFFER_SIZE];
+float derivativeBuffer[BUFFER_SIZE];
+float squaredBuffer[BUFFER_SIZE];
+float integratedBuffer[BUFFER_SIZE];
+int bufferIndex = 0;
+bool bufferFull = false;
+
+// ============================================
+// FILTROS BUTTERWORTH DE ALTA PRECISÃO
+// ============================================
+
+// Filtro passa-baixa para suavização (fc = 5 Hz, Fs = 100 Hz)
+// Remove ruído de alta frequência mantendo morfologia do pulso
+const float LP_B[3] = {0.0675, 0.1349, 0.0675};
+const float LP_A[3] = {1.0, -1.1430, 0.4128};
+float lpState[2] = {0, 0};
+
+// Filtro passa-alta para remoção de baseline (fc = 0.5 Hz, Fs = 100 Hz)  
+const float HP_B[3] = {0.9565, -1.9131, 0.9565};
+const float HP_A[3] = {1.0, -1.9112, 0.9150};
+float hpState[2] = {0, 0};
+
+// Filtro derivativo (5-point derivative para suavidade)
+const float DERIV_COEFFS[5] = {-0.125, -0.25, 0.0, 0.25, 0.125};
+float derivState[4] = {0, 0, 0, 0};
+
+// ============================================
+// PAN-TOMPKINS ADAPTADO PARA PPG
+// ============================================
+
+// Janela de integração (150ms @ 100Hz = 15 samples)
+const int INTEGRATION_WINDOW = 15;
+float integrationBuffer[INTEGRATION_WINDOW];
+int integrationIndex = 0;
+
+// Thresholds adaptativos (Pan-Tompkins)
+float signalPeakI = 0;     // Pico de sinal integrado
+float noisePeakI = 0;      // Pico de ruído integrado
+float thresholdI1 = 0;     // Threshold primário
+float thresholdI2 = 0;     // Threshold secundário
+
+float signalPeakF = 0;     // Pico de sinal filtrado
+float noisePeakF = 0;      // Pico de ruído filtrado
+float thresholdF1 = 0;     // Threshold primário filtrado
+float thresholdF2 = 0;     // Threshold secundário filtrado
+
+// Refractory period (200ms mínimo entre batimentos = 300 BPM máx)
+const unsigned long REFRACTORY_US = 200000;  // 200ms em µs
+unsigned long lastPeakTimeUS = 0;
+
+// Janela de busca para pico real (após detecção na integrada)
+const int PEAK_SEARCH_WINDOW = 15;  // 150ms
+
+// RR interval histórico para média
+const int RR_HISTORY_SIZE = 8;
+unsigned long rrHistory[RR_HISTORY_SIZE];
+int rrHistoryIndex = 0;
+bool rrHistoryFull = false;
+
+// ============================================
+// INTERPOLAÇÃO PARABÓLICA SUB-SAMPLE
+// ============================================
+
+// Retorna a posição refinada do pico com precisão sub-sample
+// Usa interpolação parabólica em 3 pontos
+float parabolicInterpolation(float y0, float y1, float y2) {
+  // y0 = antes do pico, y1 = no pico, y2 = depois do pico
+  // Retorna offset do pico real em relação a y1 (-0.5 a +0.5)
+  float denominator = 2 * (2 * y1 - y0 - y2);
+  if (abs(denominator) < 0.0001) return 0;
+  
+  return (y0 - y2) / denominator;
+}
+
+// ============================================
+// DETECÇÃO DE ARTEFATOS DE MOVIMENTO
+// ============================================
+const float MOTION_THRESHOLD = 0.3;  // 30% de variação súbita
+bool motionDetected = false;
+int motionSampleCount = 0;
+const int MOTION_RECOVERY_SAMPLES = 50;  // 500ms para recuperar
+
+bool detectMotionArtifact(float currentIR, float previousIR, float baseline) {
+  if (baseline == 0) return false;
+  
+  // Variação relativa ao baseline
+  float variation = abs(currentIR - previousIR) / baseline;
+  
+  if (variation > MOTION_THRESHOLD) {
+    motionDetected = true;
+    motionSampleCount = 0;
+    return true;
+  }
+  
+  if (motionDetected) {
+    motionSampleCount++;
+    if (motionSampleCount >= MOTION_RECOVERY_SAMPLES) {
+      motionDetected = false;
+    }
+    return true;  // Ainda em recuperação
+  }
+  
+  return false;
+}
+
+// ============================================
+// SpO2 CALCULATION (BÔNUS)
+// ============================================
+float calculateSpO2(float redAC, float redDC, float irAC, float irDC) {
+  if (irDC == 0 || redDC == 0 || irAC == 0) return 0;
+  
+  // R = (AC_red / DC_red) / (AC_ir / DC_ir)
+  float R = (redAC / redDC) / (irAC / irDC);
+  
+  // Calibração empírica: SpO2 = 110 - 25 * R
+  // Essa é uma aproximação - calibração real requer referência
+  float spo2 = 110 - 25 * R;
+  
+  return constrain(spo2, 70, 100);
+}
+
+// ============================================
+// INTERVALOS RR DE ALTA PRECISÃO
+// ============================================
+const int MAX_RR = 300;
+unsigned long rrIntervalsUS[MAX_RR];  // Em microsegundos
+float rrIntervalsMS[MAX_RR];           // Em milissegundos com precisão decimal
+int rrCount = 0;
+
+// Validação com múltiplos critérios
+bool isValidRR(float newRR_MS) {
+  // Critério 1: Range fisiológico (30-220 BPM)
+  if (newRR_MS < 273 || newRR_MS > 2000) {  // 273ms = 220 BPM
+    Serial.print("[REJ] Range: ");
+    Serial.println(newRR_MS, 1);
+    return false;
+  }
+  
+  // Critério 2: Variação vs média histórica
+  if (rrHistoryFull || rrHistoryIndex > 2) {
+    float avgRR = 0;
+    int count = rrHistoryFull ? RR_HISTORY_SIZE : rrHistoryIndex;
+    for (int i = 0; i < count; i++) {
+      avgRR += rrHistory[i] / 1000.0;
+    }
+    avgRR /= count;
+    
+    float variation = abs(newRR_MS - avgRR) / avgRR;
+    if (variation > 0.25) {  // Máximo 25% de variação
+      Serial.print("[REJ] Var ");
+      Serial.print(variation * 100, 1);
+      Serial.print("% | RR: ");
+      Serial.print(newRR_MS, 1);
+      Serial.print(" | Avg: ");
+      Serial.println(avgRR, 1);
+      return false;
+    }
+  }
+  
+  return true;
+}
+
+void addToRRHistory(unsigned long rr_us) {
+  rrHistory[rrHistoryIndex] = rr_us;
+  rrHistoryIndex = (rrHistoryIndex + 1) % RR_HISTORY_SIZE;
+  if (rrHistoryIndex == 0) rrHistoryFull = true;
+}
+
+// ============================================
+// MÉTRICAS HRV
+// ============================================
+float rmssd = 0;
+float sdnn = 0;
+float pnn50 = 0;
+float pnn20 = 0;    // Mais sensível que pNN50
+float meanRR = 0;
+float meanHR = 0;
+float sdhr = 0;     // Desvio padrão do HR
+float cvRR = 0;     // Coeficiente de variação
+
+// Métricas de qualidade
+float signalQuality = 0;
+float spo2 = 0;
+float perfusionIndex = 0;  // Índice de perfusão
+int validBeats = 0;
+int rejectedBeats = 0;
+
+// ============================================
+// ESTADOS DA MÁQUINA
+// ============================================
+enum DeviceState {
+  IDLE,
+  COUNTDOWN,
+  CALIBRATING,
+  MEASURING,
+  PROCESSING,
+  RESULTS
+};
+
+DeviceState currentState = IDLE;
+unsigned long measurementStartTime = 0;
+const unsigned long MEASUREMENT_DURATION = 60000;  // 60 segundos
+const unsigned long CALIBRATION_DURATION = 5000;   // 5 segundos (mais longo para Pan-Tompkins)
+
+// Detecção de dedo
+const long FINGER_THRESHOLD = 50000;
+unsigned long fingerDetectedTime = 0;
+const unsigned long FINGER_STABLE_TIME = 1000;
+
+// Countdown
+unsigned long countdownStart = 0;
+const unsigned long COUNTDOWN_DURATION = 5000;
+
+// Baseline para cálculos
+float irBaseline = 0;
+float redBaseline = 0;
+
+// ============================================
+// FUNÇÕES DE FILTRO
+// ============================================
+
+// Filtro IIR genérico de 2ª ordem
+float applyIIRFilter(float input, const float* b, const float* a, float* state) {
+  float output = b[0] * input + state[0];
+  state[0] = b[1] * input - a[1] * output + state[1];
+  state[1] = b[2] * input - a[2] * output;
+  return output;
+}
+
+// Pipeline de filtros completo
+float processSignal(float rawIR) {
+  // Normalizar
+  float normalized = rawIR / 100000.0;
+  
+  // 1. Passa-baixa (remove ruído HF)
+  float lowpassed = applyIIRFilter(normalized, LP_B, LP_A, lpState);
+  
+  // 2. Passa-alta (remove baseline drift)
+  float filtered = applyIIRFilter(lowpassed, HP_B, HP_A, hpState);
+  
+  return filtered;
+}
+
+// Derivada com 5 pontos (mais suave)
+float calculateDerivative(int currentIndex) {
+  if (!bufferFull && currentIndex < 4) return 0;
+  
+  float sum = 0;
+  for (int i = 0; i < 5; i++) {
+    int idx = (currentIndex - 4 + i + BUFFER_SIZE) % BUFFER_SIZE;
+    sum += DERIV_COEFFS[i] * filteredBuffer[idx];
+  }
+  
+  return sum * PROCESSING_RATE;  // Normalizar por taxa de amostragem
+}
+
+// Quadrado (enfatiza picos)
+float squareSignal(float derivative) {
+  return derivative * derivative;
+}
+
+// Integração com janela móvel
+float integrateSignal(float squared) {
+  integrationBuffer[integrationIndex] = squared;
+  integrationIndex = (integrationIndex + 1) % INTEGRATION_WINDOW;
+  
+  float sum = 0;
+  for (int i = 0; i < INTEGRATION_WINDOW; i++) {
+    sum += integrationBuffer[i];
+  }
+  
+  return sum / INTEGRATION_WINDOW;
+}
+
+// ============================================
+// RESET COMPLETO
+// ============================================
+void resetMeasurement() {
+  // Reset buffers
+  for (int i = 0; i < BUFFER_SIZE; i++) {
+    irBuffer[i] = 0;
+    redBuffer[i] = 0;
+    filteredBuffer[i] = 0;
+    derivativeBuffer[i] = 0;
+    squaredBuffer[i] = 0;
+    integratedBuffer[i] = 0;
+  }
+  bufferIndex = 0;
+  bufferFull = false;
+  
+  // Reset filtros
+  lpState[0] = lpState[1] = 0;
+  hpState[0] = hpState[1] = 0;
+  
+  // Reset integração
+  for (int i = 0; i < INTEGRATION_WINDOW; i++) {
+    integrationBuffer[i] = 0;
+  }
+  integrationIndex = 0;
+  
+  // Reset Pan-Tompkins thresholds
+  signalPeakI = noisePeakI = thresholdI1 = thresholdI2 = 0;
+  signalPeakF = noisePeakF = thresholdF1 = thresholdF2 = 0;
+  
+  // Reset RR
+  rrCount = 0;
+  validBeats = 0;
+  rejectedBeats = 0;
+  for (int i = 0; i < RR_HISTORY_SIZE; i++) {
+    rrHistory[i] = 0;
+  }
+  rrHistoryIndex = 0;
+  rrHistoryFull = false;
+  
+  lastPeakTimeUS = 0;
+  
+  // Reset motion detection
+  motionDetected = false;
+  motionSampleCount = 0;
+  
+  // Reset baselines
+  irBaseline = 0;
+  redBaseline = 0;
+  
+  // Reset métricas
+  signalQuality = 0;
+  spo2 = 0;
+}
+
+// ============================================
+// SETUP
+// ============================================
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  
+  Serial.println("\n============================================");
+  Serial.println("   HRV MONITOR v3.0 - MAXIMUM PRECISION");
+  Serial.println("============================================");
+  Serial.println("Pan-Tompkins PPG | 400Hz ADC | Sub-sample");
+  Serial.println("============================================\n");
+  
+  // Inicializar OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED não encontrado!");
+    while (1);
+  }
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("HRV Monitor v3.0");
+  display.setCursor(0, 12);
+  display.println("MAXIMUM PRECISION");
+  display.setCursor(0, 28);
+  display.println("Pan-Tompkins PPG");
+  display.setCursor(0, 40);
+  display.println("400Hz | 18-bit ADC");
+  display.setCursor(0, 52);
+  display.println("Sub-sample interp.");
+  display.display();
+  delay(3000);
+  
+  // Inicializar MAX30105
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30105 não encontrado!");
+    display.clearDisplay();
+    display.setCursor(0, 20);
+    display.println("ERRO: Sensor");
+    display.display();
+    while (1);
+  }
+  
+  // ============================================
+  // CONFIGURAÇÃO DE MÁXIMA PRECISÃO DO SENSOR
+  // ============================================
+  
+  byte ledBrightness = 60;    // 60/255 - Bom balanço entre SNR e saturação
+  byte sampleAverage = 1;     // SEM média - máxima taxa de dados
+  byte ledMode = 2;           // Red + IR para SpO2
+  int sampleRate = 400;       // 400 Hz - máximo do sensor
+  int pulseWidth = 411;       // 411µs - máximo (18-bit ADC, mais precisão)
+  int adcRange = 16384;       // 16384 nA - range alto para evitar saturação
+  
+  particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+  particleSensor.enableDIETEMPRDY();
+  
+  // Configurações adicionais de precisão
+  particleSensor.setPulseAmplitudeRed(60);   // Amplitude do LED vermelho
+  particleSensor.setPulseAmplitudeIR(60);    // Amplitude do LED IR
+  
+  Serial.println("Configuração do sensor:");
+  Serial.print("  Sample Rate: ");
+  Serial.print(sampleRate);
+  Serial.println(" Hz");
+  Serial.print("  Pulse Width: ");
+  Serial.print(pulseWidth);
+  Serial.println(" µs (18-bit ADC)");
+  Serial.print("  ADC Range: ");
+  Serial.print(adcRange);
+  Serial.println(" nA");
+  Serial.println();
+  
+  currentState = IDLE;
+  Serial.println("Sistema pronto!");
+  showIdleScreen();
+}
+
+// ============================================
+// LOOP PRINCIPAL
+// ============================================
+void loop() {
+  static unsigned long lastSampleTime = 0;
+  static int downsampleCounter = 0;
+  static float irAccumulator = 0;
+  static float redAccumulator = 0;
+  
+  // Ler sensor a 400Hz
+  unsigned long currentTimeUS = micros();
+  
+  // Acumular samples para downsampling
+  uint32_t rawIR = particleSensor.getIR();
+  uint32_t rawRed = particleSensor.getRed();
+  
+  irAccumulator += rawIR;
+  redAccumulator += rawRed;
+  downsampleCounter++;
+  
+  // Processar a 100Hz (média de 4 samples)
+  if (currentTimeUS - lastSampleTime >= (unsigned long)SAMPLE_PERIOD_US) {
+    lastSampleTime = currentTimeUS;
+    
+    // Média dos samples acumulados
+    float avgIR = irAccumulator / downsampleCounter;
+    float avgRed = redAccumulator / downsampleCounter;
+    irAccumulator = 0;
+    redAccumulator = 0;
+    downsampleCounter = 0;
+    
+    switch (currentState) {
+      case IDLE:
+        handleIdle(avgIR);
+        break;
+      
+      case COUNTDOWN:
+        handleCountdown(avgIR);
+        break;
+      
+      case CALIBRATING:
+        handleCalibration(avgIR, avgRed);
+        break;
+      
+      case MEASURING:
+        handleMeasurement(avgIR, avgRed, currentTimeUS);
+        break;
+      
+      case PROCESSING:
+        calculateMetrics();
+        currentState = RESULTS;
+        break;
+      
+      case RESULTS:
+        showResultsScreen();
+        delay(15000);  // 15 segundos para ler resultados
+        currentState = IDLE;
+        break;
+    }
+  }
+}
+
+// ============================================
+// HANDLERS DE ESTADO
+// ============================================
+
+void handleIdle(float irValue) {
+  if (irValue > FINGER_THRESHOLD) {
+    if (fingerDetectedTime == 0) {
+      fingerDetectedTime = millis();
+      Serial.println("Dedo detectado...");
+    }
+    
+    if (millis() - fingerDetectedTime > FINGER_STABLE_TIME) {
+      currentState = COUNTDOWN;
+      countdownStart = millis();
+      Serial.println("Iniciando countdown...");
+    }
+  } else {
+    fingerDetectedTime = 0;
+  }
+  
+  showIdleScreen();
+}
+
+void handleCountdown(float irValue) {
+  if (irValue < FINGER_THRESHOLD) {
+    currentState = IDLE;
+    fingerDetectedTime = 0;
+    return;
+  }
+  
+  unsigned long elapsed = millis() - countdownStart;
+  int secondsLeft = 5 - (elapsed / 1000);
+  
+  display.clearDisplay();
+  display.setTextSize(4);
+  display.setCursor(50, 10);
+  display.println(secondsLeft);
+  display.setTextSize(1);
+  display.setCursor(5, 50);
+  display.println("Mantenha dedo firme");
+  display.display();
+  
+  if (elapsed >= COUNTDOWN_DURATION) {
+    resetMeasurement();
+    particleSensor.clearFIFO();
+    currentState = CALIBRATING;
+    measurementStartTime = millis();
+    Serial.println("\n=== Calibrando Pan-Tompkins ===");
+  }
+}
+
+void handleCalibration(float irValue, float redValue) {
+  unsigned long elapsed = millis() - measurementStartTime;
+  
+  if (irValue < FINGER_THRESHOLD) {
+    currentState = IDLE;
+    fingerDetectedTime = 0;
+    Serial.println("Dedo removido durante calibração!");
+    return;
+  }
+  
+  // Acumular baseline
+  irBaseline = (irBaseline == 0) ? irValue : irBaseline * 0.99 + irValue * 0.01;
+  redBaseline = (redBaseline == 0) ? redValue : redBaseline * 0.99 + redValue * 0.01;
+  
+  // Processar sinal
+  float filtered = processSignal(irValue);
+  float derivative = calculateDerivative(bufferIndex);
+  float squared = squareSignal(derivative);
+  float integrated = integrateSignal(squared);
+  
+  // Armazenar
+  irBuffer[bufferIndex] = irValue;
+  redBuffer[bufferIndex] = redValue;
+  filteredBuffer[bufferIndex] = filtered;
+  derivativeBuffer[bufferIndex] = derivative;
+  squaredBuffer[bufferIndex] = squared;
+  integratedBuffer[bufferIndex] = integrated;
+  
+  // Inicializar thresholds Pan-Tompkins
+  if (integrated > signalPeakI) signalPeakI = integrated;
+  if (abs(filtered) > signalPeakF) signalPeakF = abs(filtered);
+  
+  bufferIndex = (bufferIndex + 1) % BUFFER_SIZE;
+  if (bufferIndex == 0) bufferFull = true;
+  
+  // Atualizar thresholds
+  thresholdI1 = noisePeakI + 0.25 * (signalPeakI - noisePeakI);
+  thresholdI2 = 0.5 * thresholdI1;
+  thresholdF1 = noisePeakF + 0.25 * (signalPeakF - noisePeakF);
+  thresholdF2 = 0.5 * thresholdF1;
+  
+  // Display
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 5);
+  display.println("Calibrando...");
+  display.setCursor(0, 18);
+  display.print("IR Base: ");
+  display.println((int)irBaseline);
+  display.setCursor(0, 30);
+  display.print("Thr I: ");
+  display.println(thresholdI1, 4);
+  
+  int progress = (elapsed * 128) / CALIBRATION_DURATION;
+  display.drawRect(0, 48, 128, 10, SSD1306_WHITE);
+  display.fillRect(0, 48, progress, 10, SSD1306_WHITE);
+  display.display();
+  
+  if (elapsed >= CALIBRATION_DURATION) {
+    currentState = MEASURING;
+    measurementStartTime = millis();
+    lastPeakTimeUS = micros();
+    
+    Serial.println("\n=== Iniciando medição HRV v3.0 ===");
+    Serial.print("IR Baseline: ");
+    Serial.println(irBaseline);
+    Serial.print("Threshold I: ");
+    Serial.println(thresholdI1, 6);
+    Serial.print("Threshold F: ");
+    Serial.println(thresholdF1, 6);
+  }
+}
+
+void handleMeasurement(float irValue, float redValue, unsigned long currentTimeUS) {
+  unsigned long elapsedMS = millis() - measurementStartTime;
+  
+  // Verificar dedo
+  if (irValue < FINGER_THRESHOLD) {
+    currentState = IDLE;
+    fingerDetectedTime = 0;
+    Serial.println("Dedo removido!");
+    return;
+  }
+  
+  // Detectar artefato de movimento
+  int prevIdx = (bufferIndex - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+  if (detectMotionArtifact(irValue, irBuffer[prevIdx], irBaseline)) {
+    // Marcar como artefato mas continuar processando para preencher buffer
+  }
+  
+  // ========================================
+  // PIPELINE PAN-TOMPKINS PARA PPG
+  // ========================================
+  
+  // 1. Filtrar (bandpass)
+  float filtered = processSignal(irValue);
+  
+  // Armazenar para derivada
+  filteredBuffer[bufferIndex] = filtered;
+  
+  // 2. Derivada (5-point)
+  float derivative = calculateDerivative(bufferIndex);
+  derivativeBuffer[bufferIndex] = derivative;
+  
+  // 3. Quadrado
+  float squared = squareSignal(derivative);
+  squaredBuffer[bufferIndex] = squared;
+  
+  // 4. Integração com janela móvel
+  float integrated = integrateSignal(squared);
+  integratedBuffer[bufferIndex] = integrated;
+  
+  // Armazenar valores brutos
+  irBuffer[bufferIndex] = irValue;
+  redBuffer[bufferIndex] = redValue;
+  
+  // ========================================
+  // DETECÇÃO DE PICO (PAN-TOMPKINS)
+  // ========================================
+  
+  unsigned long timeSinceLastPeak = currentTimeUS - lastPeakTimeUS;
+  static bool searchingPeak = false;
+  static int peakSearchStart = 0;
+  static float maxFiltered = 0;
+  static int maxFilteredIndex = 0;
+  static unsigned long potentialPeakTime = 0;
+  
+  // Verificar se passou threshold integrado
+  if (integrated > thresholdI1 && !searchingPeak && timeSinceLastPeak >= REFRACTORY_US && !motionDetected) {
+    searchingPeak = true;
+    peakSearchStart = bufferIndex;
+    maxFiltered = abs(filtered);
+    maxFilteredIndex = bufferIndex;
+    potentialPeakTime = currentTimeUS;
+  }
+  
+  // Durante busca, encontrar máximo do sinal filtrado
+  if (searchingPeak) {
+    if (abs(filtered) > maxFiltered) {
+      maxFiltered = abs(filtered);
+      maxFilteredIndex = bufferIndex;
+      potentialPeakTime = currentTimeUS;
+    }
+    
+    // Fim da janela de busca ou sinal caiu abaixo do threshold
+    int searchDuration = (bufferIndex - peakSearchStart + BUFFER_SIZE) % BUFFER_SIZE;
+    
+    if (searchDuration >= PEAK_SEARCH_WINDOW || integrated < thresholdI2) {
+      searchingPeak = false;
+      
+      // Validar que é um pico real
+      if (maxFiltered > thresholdF1) {
+        // ====================================
+        // INTERPOLAÇÃO PARABÓLICA SUB-SAMPLE
+        // ====================================
+        int idx0 = (maxFilteredIndex - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+        int idx1 = maxFilteredIndex;
+        int idx2 = (maxFilteredIndex + 1) % BUFFER_SIZE;
+        
+        float y0 = abs(filteredBuffer[idx0]);
+        float y1 = abs(filteredBuffer[idx1]);
+        float y2 = abs(filteredBuffer[idx2]);
+        
+        float subSampleOffset = parabolicInterpolation(y0, y1, y2);
+        
+        // Tempo refinado do pico (em µs)
+        float refinedTimeOffsetUS = subSampleOffset * SAMPLE_PERIOD_US;
+        unsigned long refinedPeakTimeUS = potentialPeakTime + (long)refinedTimeOffsetUS;
+        
+        // Calcular RR interval
+        unsigned long rrUS = refinedPeakTimeUS - lastPeakTimeUS;
+        float rrMS = rrUS / 1000.0;
+        
+        // Validar RR
+        if (isValidRR(rrMS)) {
+          rrIntervalsUS[rrCount] = rrUS;
+          rrIntervalsMS[rrCount] = rrMS;
+          rrCount++;
+          validBeats++;
+          
+          addToRRHistory(rrUS);
+          
+          // Atualizar thresholds (signal peak)
+          signalPeakI = 0.125 * integrated + 0.875 * signalPeakI;
+          signalPeakF = 0.125 * maxFiltered + 0.875 * signalPeakF;
+          
+          // Calcular métricas instantâneas
+          float bpm = 60000.0 / rrMS;
+          
+          Serial.print("[BEAT] T:");
+          Serial.print(elapsedMS / 1000);
+          Serial.print("s | RR:");
+          Serial.print(rrMS, 2);
+          Serial.print("ms | BPM:");
+          Serial.print(bpm, 1);
+          Serial.print(" | Offset:");
+          Serial.print(subSampleOffset, 3);
+          Serial.print(" | N:");
+          Serial.println(rrCount);
+        } else {
+          rejectedBeats++;
+        }
+        
+        lastPeakTimeUS = refinedPeakTimeUS;
+      } else {
+        // Atualizar noise peak
+        noisePeakI = 0.125 * integrated + 0.875 * noisePeakI;
+        noisePeakF = 0.125 * maxFiltered + 0.875 * noisePeakF;
+      }
+      
+      // Atualizar thresholds
+      thresholdI1 = noisePeakI + 0.25 * (signalPeakI - noisePeakI);
+      thresholdI2 = 0.5 * thresholdI1;
+      thresholdF1 = noisePeakF + 0.25 * (signalPeakF - noisePeakF);
+      thresholdF2 = 0.5 * thresholdF1;
+    }
+  }
+  
+  // Calcular SpO2 periodicamente
+  static int spo2Counter = 0;
+  if (spo2Counter++ % 100 == 0 && rrCount > 5) {
+    // AC é a amplitude do sinal filtrado
+    float irAC = signalPeakF * 100000;  // Desnormalizar
+    float redAC = signalPeakF * 100000 * 0.9;  // Aproximação
+    spo2 = calculateSpO2(redAC, redBaseline, irAC, irBaseline);
+  }
+  
+  // Calcular qualidade do sinal
+  float currentSNR = (signalPeakI > 0 && noisePeakI > 0) ? signalPeakI / noisePeakI : 0;
+  signalQuality = min(100.0f, currentSNR * 20);
+  
+  // Índice de perfusão: (AC / DC) * 100
+  if (irBaseline > 0) {
+    perfusionIndex = (signalPeakF * 100000 / irBaseline) * 100;
+  }
+  
+  // Avançar buffer
+  bufferIndex = (bufferIndex + 1) % BUFFER_SIZE;
+  if (bufferIndex == 0) bufferFull = true;
+  
+  // ========================================
+  // ATUALIZAR DISPLAY
+  // ========================================
+  static int displayCounter = 0;
+  if (displayCounter++ % 10 == 0) {
+    display.clearDisplay();
+    
+    // BPM
+    float currentBPM = 0;
+    if (rrCount > 0) {
+      currentBPM = 60000.0 / rrIntervalsMS[rrCount - 1];
+    }
+    
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    display.print((int)currentBPM);
+    display.setTextSize(1);
+    display.setCursor(45, 5);
+    display.println("BPM");
+    
+    // Qualidade e SpO2
+    display.setCursor(70, 0);
+    display.print("Q:");
+    display.print((int)signalQuality);
+    display.println("%");
+    
+    display.setCursor(70, 10);
+    display.print("SpO2:");
+    display.print((int)spo2);
+    
+    // Contadores
+    display.setCursor(0, 20);
+    display.print("Beats:");
+    display.print(rrCount);
+    display.print(" Rej:");
+    display.println(rejectedBeats);
+    
+    // Último RR
+    if (rrCount > 0) {
+      display.setCursor(0, 30);
+      display.print("RR:");
+      display.print(rrIntervalsMS[rrCount - 1], 1);
+      display.println("ms");
+    }
+    
+    // Motion indicator
+    if (motionDetected) {
+      display.setCursor(90, 30);
+      display.println("MOTION!");
+    }
+    
+    // Barra de progresso
+    int progress = (elapsedMS * 128) / MEASUREMENT_DURATION;
+    display.drawRect(0, 42, 128, 8, SSD1306_WHITE);
+    display.fillRect(0, 42, progress, 8, SSD1306_WHITE);
+    
+    // Tempo
+    display.setCursor(0, 54);
+    display.print((MEASUREMENT_DURATION - elapsedMS) / 1000);
+    display.print("s | PI:");
+    display.print(perfusionIndex, 1);
+    display.println("%");
+    
+    display.display();
+  }
+  
+  // Log periódico detalhado
+  static int logCounter = 0;
+  if (logCounter++ % 200 == 0) {
+    Serial.print("T:");
+    Serial.print(elapsedMS / 1000);
+    Serial.print("s | IR:");
+    Serial.print((int)irValue);
+    Serial.print(" | Filt:");
+    Serial.print(filtered, 5);
+    Serial.print(" | Int:");
+    Serial.print(integrated, 5);
+    Serial.print(" | ThrI:");
+    Serial.print(thresholdI1, 5);
+    Serial.print(" | Beats:");
+    Serial.print(rrCount);
+    Serial.print(" | Q:");
+    Serial.print((int)signalQuality);
+    Serial.println("%");
+  }
+  
+  // Verificar fim da medição
+  if (elapsedMS >= MEASUREMENT_DURATION) {
+    if (rrCount >= 20) {
+      currentState = PROCESSING;
+      Serial.println("\n=== Medição concluída ===");
+    } else {
+      Serial.print("\nPoucos batimentos (");
+      Serial.print(rrCount);
+      Serial.println("). Tente novamente.");
+      currentState = IDLE;
+    }
+  }
+}
+
+// ============================================
+// CÁLCULO DE MÉTRICAS HRV COMPLETAS
+// ============================================
+void calculateMetrics() {
+  if (rrCount < 5) {
+    Serial.println("Dados insuficientes");
+    return;
+  }
+  
+  Serial.println("\n========================================================");
+  Serial.println("   RESULTADOS HRV v3.0 - MAXIMUM PRECISION");
+  Serial.println("========================================================\n");
+  
+  // Usar valores em MS com precisão decimal
+  float* rr = rrIntervalsMS;
+  int n = rrCount;
+  
+  // Média RR
+  meanRR = 0;
+  for (int i = 0; i < n; i++) {
+    meanRR += rr[i];
+  }
+  meanRR /= n;
+  
+  // FC média e desvio
+  meanHR = 60000.0 / meanRR;
+  
+  // SDNN - Desvio padrão de todos os intervalos NN
+  float sumSqDiff = 0;
+  for (int i = 0; i < n; i++) {
+    float diff = rr[i] - meanRR;
+    sumSqDiff += diff * diff;
+  }
+  sdnn = sqrt(sumSqDiff / n);
+  
+  // SDHR - Desvio padrão do HR
+  float hrValues[MAX_RR];
+  float meanHRTemp = 0;
+  for (int i = 0; i < n; i++) {
+    hrValues[i] = 60000.0 / rr[i];
+    meanHRTemp += hrValues[i];
+  }
+  meanHRTemp /= n;
+  
+  float sumSqDiffHR = 0;
+  for (int i = 0; i < n; i++) {
+    float diff = hrValues[i] - meanHRTemp;
+    sumSqDiffHR += diff * diff;
+  }
+  sdhr = sqrt(sumSqDiffHR / n);
+  
+  // RMSSD - Raiz da média dos quadrados das diferenças sucessivas
+  float sumSqSuccDiff = 0;
+  for (int i = 0; i < n - 1; i++) {
+    float diff = rr[i + 1] - rr[i];
+    sumSqSuccDiff += diff * diff;
+  }
+  rmssd = sqrt(sumSqSuccDiff / (n - 1));
+  
+  // pNN50 e pNN20
+  int nn50 = 0, nn20 = 0;
+  for (int i = 0; i < n - 1; i++) {
+    float diff = abs(rr[i + 1] - rr[i]);
+    if (diff > 50) nn50++;
+    if (diff > 20) nn20++;
+  }
+  pnn50 = (nn50 * 100.0) / (n - 1);
+  pnn20 = (nn20 * 100.0) / (n - 1);
+  
+  // Coeficiente de variação
+  cvRR = (sdnn / meanRR) * 100;
+  
+  // Imprimir resultados detalhados
+  Serial.println("--- MÉTRICAS TEMPORAIS ---");
+  Serial.print("Intervalos RR válidos:  ");
+  Serial.println(n);
+  Serial.print("Intervalos rejeitados:  ");
+  Serial.println(rejectedBeats);
+  Serial.print("Taxa de aceitação:      ");
+  Serial.print((n * 100.0) / (n + rejectedBeats), 1);
+  Serial.println("%");
+  Serial.println();
+  
+  Serial.print("RR Médio:      ");
+  Serial.print(meanRR, 2);
+  Serial.println(" ms");
+  
+  Serial.print("FC Média:      ");
+  Serial.print(meanHR, 1);
+  Serial.println(" BPM");
+  
+  Serial.print("SDNN:          ");
+  Serial.print(sdnn, 2);
+  Serial.println(" ms");
+  
+  Serial.print("RMSSD:         ");
+  Serial.print(rmssd, 2);
+  Serial.println(" ms");
+  
+  Serial.print("pNN50:         ");
+  Serial.print(pnn50, 2);
+  Serial.println(" %");
+  
+  Serial.print("pNN20:         ");
+  Serial.print(pnn20, 2);
+  Serial.println(" %");
+  
+  Serial.print("CV(RR):        ");
+  Serial.print(cvRR, 2);
+  Serial.println(" %");
+  
+  Serial.print("SD(HR):        ");
+  Serial.print(sdhr, 2);
+  Serial.println(" BPM");
+  
+  Serial.println();
+  Serial.println("--- QUALIDADE DO SINAL ---");
+  Serial.print("Qualidade:     ");
+  Serial.print(signalQuality, 1);
+  Serial.println(" %");
+  
+  Serial.print("SpO2 (est):    ");
+  Serial.print(spo2, 1);
+  Serial.println(" %");
+  
+  Serial.print("Perf. Index:   ");
+  Serial.print(perfusionIndex, 2);
+  Serial.println(" %");
+  
+  Serial.println();
+  Serial.println("========================================================");
+  Serial.println();
+  
+  // Estatísticas dos RR para debug
+  Serial.println("--- DISTRIBUIÇÃO RR (primeiros 20) ---");
+  for (int i = 0; i < min(20, n); i++) {
+    Serial.print(rr[i], 2);
+    Serial.print(" ");
+    if ((i + 1) % 10 == 0) Serial.println();
+  }
+  Serial.println("\n");
+}
+
+// ============================================
+// TELAS
+// ============================================
+void showIdleScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("HRV Monitor v3.0");
+  display.setCursor(0, 12);
+  display.println("MAXIMUM PRECISION");
+  display.drawLine(0, 22, 128, 22, SSD1306_WHITE);
+  display.setCursor(0, 28);
+  display.println("Coloque o dedo no");
+  display.setCursor(0, 40);
+  display.println("sensor para iniciar");
+  display.setCursor(0, 54);
+  display.println("Pan-Tompkins | 400Hz");
+  display.display();
+}
+
+void showResultsScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("=== RESULTADOS ===");
+  
+  display.setCursor(0, 11);
+  display.print("FC: ");
+  display.print((int)meanHR);
+  display.print(" BPM");
+  display.setCursor(70, 11);
+  display.print("N:");
+  display.println(rrCount);
+  
+  display.setCursor(0, 21);
+  display.print("SDNN:  ");
+  display.print((int)sdnn);
+  display.println(" ms");
+  
+  display.setCursor(0, 31);
+  display.print("RMSSD: ");
+  display.print((int)rmssd);
+  display.println(" ms");
+  
+  display.setCursor(0, 41);
+  display.print("pNN50: ");
+  display.print((int)pnn50);
+  display.print("%");
+  display.setCursor(70, 41);
+  display.print("Q:");
+  display.print((int)signalQuality);
+  display.println("%");
+  
+  display.setCursor(0, 51);
+  display.print("SpO2:");
+  display.print((int)spo2);
+  display.print("%");
+  display.setCursor(55, 51);
+  display.print("PI:");
+  display.print(perfusionIndex, 1);
+  display.println("%");
+  
+  display.display();
+}

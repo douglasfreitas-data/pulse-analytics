@@ -1,0 +1,39 @@
+# OS specific
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# C++ / Firmware / Arduino
+.pio/
+.pioenvs/
+.piolibdeps/
+*.elf
+*.bin
+*.hex
+*.o
+*.a
+*.d
+build/
+output/
+
+# Python / Data Analysis
+__pycache__/
+*.py[cod]
+*$py.class
+*.ipynb_checkpoints/
+.env
+venv/
+env/
+.venv/
+*.csv
+*.log
+
+# Project specific
+# Ignore raw data dumps if they are large, but easy to regenerate
+data_dumps/

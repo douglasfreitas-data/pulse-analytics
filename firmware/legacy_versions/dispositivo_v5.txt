@@ -1,0 +1,707 @@
+#include <Wire.h>
+#include <MAX30105.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <SPIFFS.h>
+
+/*
+ * ============================================
+ * HRV MONITOR v5.0 - COM DATA LOGGING
+ * ============================================
+ * 
+ * Novidades:
+ * - Salva resultados em arquivo na flash (SPIFFS)
+ * - Múltiplas sessões com timestamp relativo
+ * - Comando Serial para exportar dados
+ * - Menu para ver histórico no OLED
+ */
+
+// OLED Display
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// MAX30105
+MAX30105 particleSensor;
+
+// ============================================
+// CONFIGURAÇÕES
+// ============================================
+const byte RATE_SIZE = 4;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+int beatAvg = 0;
+
+// RR Intervals
+const int MAX_RR = 300;
+unsigned long rrIntervalsUS[MAX_RR];
+float rrIntervalsMS[MAX_RR];
+int rrCount = 0;
+
+// Timing
+unsigned long lastBeatUS = 0;
+unsigned long sampleStartTime = 0;
+unsigned long bootTime = 0;
+const unsigned long SAMPLE_DURATION = 120000;
+
+// Métricas HRV
+float rmssd = 0;
+float sdnn = 0;
+float pnn50 = 0;
+float meanHR = 0;
+
+// ============================================
+// DATA LOGGING
+// ============================================
+const char* LOG_FILE = "/hrv_log.csv";
+int sessionNumber = 0;
+
+struct HRVSession {
+  int session;
+  unsigned long timestamp;  // Minutos desde boot
+  float fc;
+  float sdnn;
+  float rmssd;
+  float pnn50;
+  int rrValid;
+};
+
+// ============================================
+// ESTADOS
+// ============================================
+enum DeviceState {
+  IDLE,
+  COUNTDOWN,
+  MEASURING,
+  PROCESSING,
+  RESULTS,
+  MENU,
+  VIEW_LOG
+};
+DeviceState currentState = IDLE;
+
+// Detecção de dedo
+const long FINGER_THRESHOLD = 30000;
+unsigned long fingerDetectedTime = 0;
+const unsigned long FINGER_STABLE_TIME = 1000;
+
+// Countdown
+unsigned long countdownStart = 0;
+const unsigned long COUNTDOWN_DURATION = 5000;
+
+// Detecção de pico
+uint32_t irMin = 0;
+uint32_t irMax = 0;
+uint32_t lastIR = 0;
+bool wasBelow = false;
+
+// Validação RR
+const int RR_AVG_SIZE = 5;
+unsigned long rrAvgBuffer[RR_AVG_SIZE];
+int rrAvgIndex = 0;
+bool rrAvgFull = false;
+
+// ============================================
+// FUNÇÕES DE LOGGING
+// ============================================
+
+void initSPIFFS() {
+  if (!SPIFFS.begin(true)) {
+    Serial.println("Erro ao montar SPIFFS!");
+    return;
+  }
+  Serial.println("SPIFFS montado com sucesso");
+  
+  // Contar sessões existentes
+  if (SPIFFS.exists(LOG_FILE)) {
+    File file = SPIFFS.open(LOG_FILE, "r");
+    if (file) {
+      while (file.available()) {
+        String line = file.readStringUntil('\n');
+        if (line.length() > 0 && line[0] != 'S') {  // Não é header
+          sessionNumber++;
+        }
+      }
+      file.close();
+    }
+    Serial.print("Sessoes anteriores: ");
+    Serial.println(sessionNumber);
+  } else {
+    // Criar arquivo com header
+    File file = SPIFFS.open(LOG_FILE, "w");
+    if (file) {
+      file.println("Sessao,MinutosDesdeboot,FC,SDNN,RMSSD,pNN50,RRvalidos");
+      file.close();
+    }
+  }
+}
+
+void saveSession(HRVSession& session) {
+  File file = SPIFFS.open(LOG_FILE, "a");
+  if (file) {
+    file.print(session.session);
+    file.print(",");
+    file.print(session.timestamp);
+    file.print(",");
+    file.print(session.fc, 1);
+    file.print(",");
+    file.print(session.sdnn, 1);
+    file.print(",");
+    file.print(session.rmssd, 1);
+    file.print(",");
+    file.print(session.pnn50, 1);
+    file.print(",");
+    file.println(session.rrValid);
+    file.close();
+    
+    Serial.println("Sessao salva no log!");
+  } else {
+    Serial.println("Erro ao salvar sessao!");
+  }
+}
+
+void printLog() {
+  Serial.println("\n========== LOG DE SESSOES ==========");
+  
+  if (!SPIFFS.exists(LOG_FILE)) {
+    Serial.println("Nenhum log encontrado");
+    return;
+  }
+  
+  File file = SPIFFS.open(LOG_FILE, "r");
+  if (file) {
+    while (file.available()) {
+      Serial.println(file.readStringUntil('\n'));
+    }
+    file.close();
+  }
+  
+  Serial.println("=====================================\n");
+}
+
+void clearLog() {
+  SPIFFS.remove(LOG_FILE);
+  File file = SPIFFS.open(LOG_FILE, "w");
+  if (file) {
+    file.println("Sessao,MinutosDesdeboot,FC,SDNN,RMSSD,pNN50,RRvalidos");
+    file.close();
+  }
+  sessionNumber = 0;
+  Serial.println("Log limpo!");
+}
+
+int getSessionCount() {
+  int count = 0;
+  if (SPIFFS.exists(LOG_FILE)) {
+    File file = SPIFFS.open(LOG_FILE, "r");
+    if (file) {
+      while (file.available()) {
+        String line = file.readStringUntil('\n');
+        if (line.length() > 0 && line[0] != 'S') {
+          count++;
+        }
+      }
+      file.close();
+    }
+  }
+  return count;
+}
+
+// ============================================
+// FUNÇÕES DE VALIDAÇÃO RR
+// ============================================
+
+unsigned long getAverageRR() {
+  if (!rrAvgFull && rrAvgIndex == 0) return 850000;
+  int count = rrAvgFull ? RR_AVG_SIZE : rrAvgIndex;
+  unsigned long sum = 0;
+  for (int i = 0; i < count; i++) {
+    sum += rrAvgBuffer[i];
+  }
+  return sum / count;
+}
+
+void addToRRAverage(unsigned long rr) {
+  rrAvgBuffer[rrAvgIndex] = rr;
+  rrAvgIndex = (rrAvgIndex + 1) % RR_AVG_SIZE;
+  if (rrAvgIndex == 0) rrAvgFull = true;
+}
+
+bool isValidRR(unsigned long newRR, unsigned long lastRR) {
+  if (newRR < 300000 || newRR > 2000000) return false;
+  
+  if (lastRR > 0) {
+    float variation = abs((float)newRR - lastRR) / lastRR;
+    if (variation > 0.35) return false;
+  }
+  
+  unsigned long avgRR = getAverageRR();
+  float varFromAvg = abs((float)newRR - avgRR) / avgRR;
+  if (varFromAvg > 0.40) return false;
+  
+  return true;
+}
+
+// ============================================
+// RESET
+// ============================================
+void resetDetection() {
+  irMin = 0;
+  irMax = 0;
+  lastIR = 0;
+  wasBelow = false;
+  lastBeatUS = 0;
+  
+  rrCount = 0;
+  for (int i = 0; i < RR_AVG_SIZE; i++) rrAvgBuffer[i] = 0;
+  rrAvgIndex = 0;
+  rrAvgFull = false;
+  
+  for (int i = 0; i < RATE_SIZE; i++) rates[i] = 0;
+  rateSpot = 0;
+  beatAvg = 0;
+  
+  rmssd = sdnn = pnn50 = meanHR = 0;
+}
+
+// ============================================
+// SETUP
+// ============================================
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  
+  bootTime = millis();
+  
+  Serial.println("\n============================================");
+  Serial.println("   HRV MONITOR v5.0 - COM DATA LOGGING");
+  Serial.println("============================================");
+  Serial.println("Comandos Serial:");
+  Serial.println("  'l' - Ver log de sessoes");
+  Serial.println("  'c' - Limpar log");
+  Serial.println("============================================\n");
+  
+  // OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED nao encontrado!");
+    while (1);
+  }
+  
+  // SPIFFS
+  initSPIFFS();
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("HRV Monitor v5.0");
+  display.setCursor(0, 15);
+  display.println("COM DATA LOGGING");
+  display.setCursor(0, 35);
+  display.print("Sessoes salvas: ");
+  display.println(sessionNumber);
+  display.display();
+  delay(2000);
+  
+  // MAX30105
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30105 nao encontrado!");
+    while (1);
+  }
+  
+  byte ledBrightness = 25;
+  byte sampleAverage = 1;
+  byte ledMode = 2;
+  byte sampleRate = 400;
+  int pulseWidth = 411;
+  int adcRange = 4096;
+  
+  particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+  
+  currentState = IDLE;
+  Serial.println("Sistema pronto!");
+}
+
+// ============================================
+// LOOP
+// ============================================
+void loop() {
+  // Processar comandos Serial
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    if (cmd == 'l' || cmd == 'L') {
+      printLog();
+    } else if (cmd == 'c' || cmd == 'C') {
+      clearLog();
+    }
+  }
+  
+  switch(currentState) {
+    case IDLE:
+      handleIdle();
+      break;
+    
+    case COUNTDOWN:
+      handleCountdown();
+      break;
+    
+    case MEASURING:
+      handleMeasurement();
+      break;
+    
+    case PROCESSING:
+      calculateMetrics();
+      currentState = RESULTS;
+      break;
+    
+    case RESULTS:
+      showResultsScreen();
+      delay(10000);
+      currentState = IDLE;
+      break;
+  }
+  
+  delay(10);
+}
+
+// ============================================
+// HANDLERS
+// ============================================
+
+void handleIdle() {
+  uint32_t irValue = particleSensor.getIR();
+  
+  if (irValue > FINGER_THRESHOLD) {
+    if (fingerDetectedTime == 0) {
+      fingerDetectedTime = millis();
+    }
+    
+    if (millis() - fingerDetectedTime > FINGER_STABLE_TIME) {
+      currentState = COUNTDOWN;
+      countdownStart = millis();
+      Serial.println("Iniciando countdown...");
+    }
+  } else {
+    fingerDetectedTime = 0;
+  }
+  
+  // Display
+  unsigned long minutesSinceBoot = (millis() - bootTime) / 60000;
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("HRV v5.0 + LOG");
+  display.setCursor(0, 12);
+  display.print("Sessoes: ");
+  display.println(sessionNumber);
+  display.setCursor(0, 24);
+  display.print("Tempo: ");
+  display.print(minutesSinceBoot);
+  display.println(" min");
+  display.setCursor(0, 40);
+  display.println("Coloque o dedo no");
+  display.setCursor(0, 52);
+  display.println("sensor para medir");
+  display.display();
+}
+
+void handleCountdown() {
+  uint32_t irValue = particleSensor.getIR();
+  
+  if (irValue < FINGER_THRESHOLD) {
+    currentState = IDLE;
+    fingerDetectedTime = 0;
+    return;
+  }
+  
+  unsigned long elapsed = millis() - countdownStart;
+  int secondsLeft = 5 - (elapsed / 1000);
+  
+  display.clearDisplay();
+  display.setTextSize(4);
+  display.setCursor(50, 10);
+  display.println(secondsLeft);
+  display.setTextSize(1);
+  display.setCursor(10, 52);
+  display.println("Mantenha dedo firme");
+  display.display();
+  
+  if (elapsed >= COUNTDOWN_DURATION) {
+    resetDetection();
+    particleSensor.clearFIFO();
+    delay(50);
+    
+    currentState = MEASURING;
+    sampleStartTime = millis();
+    lastBeatUS = micros();
+    
+    sessionNumber++;
+    Serial.print("\n=== Sessao #");
+    Serial.print(sessionNumber);
+    Serial.println(" iniciada ===");
+  }
+}
+
+void handleMeasurement() {
+  unsigned long currentTimeUS = micros();
+  unsigned long elapsedMS = millis() - sampleStartTime;
+  
+  uint32_t irValue = particleSensor.getIR();
+  
+  if (irValue < FINGER_THRESHOLD) {
+    currentState = IDLE;
+    fingerDetectedTime = 0;
+    Serial.println("Dedo removido!");
+    sessionNumber--;  // Cancelar sessão
+    return;
+  }
+  
+  // Warmup
+  if (elapsedMS < 2000) {
+    if (irMin == 0 || irValue < irMin) irMin = irValue;
+    if (irValue > irMax) irMax = irValue;
+    lastIR = irValue;
+    
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 20);
+    display.print("Sessao #");
+    display.println(sessionNumber);
+    display.setCursor(0, 35);
+    display.println("Calibrando...");
+    display.display();
+    return;
+  }
+  
+  // Threshold adaptativo
+  const float DECAY = 0.002;
+  
+  if (irValue < irMin) {
+    irMin = irValue;
+  } else {
+    irMin = irMin + (uint32_t)((irMax - irMin) * DECAY);
+  }
+  
+  if (irValue > irMax) {
+    irMax = irValue;
+  } else {
+    irMax = irMax - (uint32_t)((irMax - irMin) * DECAY);
+  }
+  
+  if (irMax - irMin < 200) {
+    uint32_t mid = (irMax + irMin) / 2;
+    irMin = mid - 200;
+    irMax = mid + 200;
+  }
+  
+  uint32_t threshold = (irMin + irMax) / 2;
+  
+  // Detecção de batimento
+  unsigned long timeSinceLastBeat = currentTimeUS - lastBeatUS;
+  
+  if (lastIR < threshold && irValue >= threshold && wasBelow) {
+    unsigned long delta = timeSinceLastBeat;
+    unsigned long lastRR = (rrCount > 0) ? rrIntervalsUS[rrCount - 1] : 0;
+    
+    if (isValidRR(delta, lastRR) && rrCount < MAX_RR) {
+      rrIntervalsUS[rrCount] = delta;
+      rrIntervalsMS[rrCount] = delta / 1000.0;
+      rrCount++;
+      
+      addToRRAverage(delta);
+      
+      float bpm = 60000000.0 / delta;
+      rates[rateSpot++] = (byte)bpm;
+      rateSpot %= RATE_SIZE;
+      
+      beatAvg = 0;
+      for (byte x = 0; x < RATE_SIZE; x++) {
+        beatAvg += rates[x];
+      }
+      beatAvg /= RATE_SIZE;
+      
+      Serial.print("[BEAT] RR:");
+      Serial.print(delta / 1000);
+      Serial.print("ms BPM:");
+      Serial.print((int)bpm);
+      Serial.print(" N:");
+      Serial.println(rrCount);
+    }
+    
+    lastBeatUS = currentTimeUS;
+  }
+  
+  wasBelow = (irValue < threshold);
+  lastIR = irValue;
+  
+  // Display
+  static int displayCount = 0;
+  if (displayCount++ % 10 == 0) {
+    display.clearDisplay();
+    
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print("Sessao #");
+    display.println(sessionNumber);
+    
+    display.setTextSize(2);
+    display.setCursor(0, 12);
+    display.print(beatAvg);
+    display.setTextSize(1);
+    display.setCursor(45, 17);
+    display.println("BPM");
+    
+    display.setCursor(80, 12);
+    display.print("N:");
+    display.println(rrCount);
+    
+    int progress = (elapsedMS * 128) / SAMPLE_DURATION;
+    display.drawRect(0, 35, 128, 10, SSD1306_WHITE);
+    display.fillRect(0, 35, progress, 10, SSD1306_WHITE);
+    
+    display.setCursor(0, 50);
+    display.print((SAMPLE_DURATION - elapsedMS) / 1000);
+    display.print("s");
+    
+    display.display();
+  }
+  
+  if (elapsedMS >= SAMPLE_DURATION) {
+    if (rrCount >= 20) {
+      currentState = PROCESSING;
+      Serial.println("\n=== Medicao concluida ===");
+    } else {
+      Serial.println("\nPoucos batimentos. Tente novamente.");
+      sessionNumber--;
+      currentState = IDLE;
+    }
+  }
+}
+
+// ============================================
+// CÁLCULO E SALVAMENTO
+// ============================================
+void calculateMetrics() {
+  if (rrCount < 5) {
+    Serial.println("Dados insuficientes");
+    return;
+  }
+  
+  float* rr = rrIntervalsMS;
+  int n = rrCount;
+  
+  // Média RR
+  float meanRR = 0;
+  for (int i = 0; i < n; i++) {
+    meanRR += rr[i];
+  }
+  meanRR /= n;
+  
+  meanHR = 60000.0 / meanRR;
+  
+  // SDNN
+  float sumSqDiff = 0;
+  for (int i = 0; i < n; i++) {
+    float diff = rr[i] - meanRR;
+    sumSqDiff += diff * diff;
+  }
+  sdnn = sqrt(sumSqDiff / n);
+  
+  // RMSSD
+  float sumSqSuccDiff = 0;
+  for (int i = 0; i < n - 1; i++) {
+    float diff = rr[i + 1] - rr[i];
+    sumSqSuccDiff += diff * diff;
+  }
+  rmssd = sqrt(sumSqSuccDiff / (n - 1));
+  
+  // pNN50
+  int nn50 = 0;
+  for (int i = 0; i < n - 1; i++) {
+    if (abs(rr[i + 1] - rr[i]) > 50) {
+      nn50++;
+    }
+  }
+  pnn50 = (nn50 * 100.0) / (n - 1);
+  
+  // Salvar no log
+  unsigned long minutesSinceBoot = (millis() - bootTime) / 60000;
+  
+  HRVSession session;
+  session.session = sessionNumber;
+  session.timestamp = minutesSinceBoot;
+  session.fc = meanHR;
+  session.sdnn = sdnn;
+  session.rmssd = rmssd;
+  session.pnn50 = pnn50;
+  session.rrValid = n;
+  
+  saveSession(session);
+  
+  // Imprimir
+  Serial.println("\n========================================================");
+  Serial.print("   SESSAO #");
+  Serial.print(sessionNumber);
+  Serial.print(" - ");
+  Serial.print(minutesSinceBoot);
+  Serial.println(" min desde boot");
+  Serial.println("========================================================");
+  Serial.print("FC Media:     ");
+  Serial.print(meanHR, 1);
+  Serial.println(" BPM");
+  Serial.print("SDNN:         ");
+  Serial.print(sdnn, 1);
+  Serial.println(" ms");
+  Serial.print("RMSSD:        ");
+  Serial.print(rmssd, 1);
+  Serial.println(" ms");
+  Serial.print("pNN50:        ");
+  Serial.print(pnn50, 1);
+  Serial.println(" %");
+  Serial.print("RR validos:   ");
+  Serial.println(n);
+  Serial.println("========================================================\n");
+  
+  beatAvg = (int)meanHR;
+}
+
+void showResultsScreen() {
+  unsigned long minutesSinceBoot = (millis() - bootTime) / 60000;
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("SESSAO #");
+  display.print(sessionNumber);
+  display.print(" (");
+  display.print(minutesSinceBoot);
+  display.println("m)");
+  
+  display.setCursor(0, 12);
+  display.print("FC: ");
+  display.print((int)meanHR);
+  display.print(" BPM  N:");
+  display.println(rrCount);
+  
+  display.setCursor(0, 24);
+  display.print("SDNN:  ");
+  display.print((int)sdnn);
+  display.println(" ms");
+  
+  display.setCursor(0, 36);
+  display.print("RMSSD: ");
+  display.print((int)rmssd);
+  display.println(" ms");
+  
+  display.setCursor(0, 48);
+  display.print("pNN50: ");
+  display.print((int)pnn50);
+  display.println(" %");
+  
+  display.setCursor(80, 48);
+  display.println("[SALVO]");
+  
+  display.display();
+}
