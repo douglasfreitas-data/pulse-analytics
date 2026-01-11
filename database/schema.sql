@@ -7,8 +7,10 @@ CREATE TABLE IF NOT EXISTS hrv_sessions (
     
     -- Metadata
     device_id TEXT DEFAULT 'ESP32-S3',
+    user_name TEXT DEFAULT 'Visitante', -- Name of the person being measured
     session_index INT, -- Matches the 'sessionNumber' on device
     timestamp_device_min INT, -- Minutes since boot
+    sampling_rate_hz INT DEFAULT 200, -- Sampling rate in Hz (e.g. 200)
     
     -- Metrics (Computed on Device)
     fc_mean FLOAT,

@@ -37,6 +37,17 @@
 4.  **Git:** This folder is intended to be its own Git repository. If not yet initialized, suggest doing so.
 
 ## 📌 To-Do List
-- [ ] Initialize Git repository for `pulse-analytics`.
-- [ ] Specific compilation check of the latest firmware code.
+- [x] Initialize Git repository for `pulse-analytics`.
+- [x] Specific compilation check of the latest firmware code.
 - [ ] Create a Python script to visualize the Serial plotter data in real-time or from a CSV dump.
+
+## 🧠 Technical Implementation Details
+
+### High-Volume Data Upload (Chunked Streaming)
+To support the "Data Science" requirement of uploading 60 seconds of raw 3-channel data @ 200Hz (approx. 36,000 samples + RR intervals), we encountered ESP32 RAM limitations when attempting to allocate a single JSON string (approx. 200KB).
+
+**Solution:** Implemented **Chunked Transfer Encoding** using `NetworkClientSecure` directly, bypassing the standard `HTTPClient` payload buffering.
+- **Protocol:** HTTP/1.1 `Transfer-Encoding: chunked` over SSL.
+- **Strategy:** The JSON object is constructed piece-by-piece and sent in small chunks (50 array items per flush).
+- **Benefit:** Allows uploading arbitrarily large datasets (limited only by Supabase timeouts, not RAM) with minimal memory footprint (~4KB buffer).
+- **Key Code:** `sendChunk()` helper and lambda-based array streaming in `uploadSession()`.
