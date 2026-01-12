@@ -4,8 +4,13 @@
 #include <Adafruit_SSD1306.h>
 #include <SPIFFS.h>
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <HTTPClient.h>
 #include <NetworkClientSecure.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
 /*
  * ============================================
@@ -53,11 +58,19 @@ uint16_t redBuffer[BUFFER_SIZE];
 uint16_t greenBuffer[BUFFER_SIZE];
 int bufferIndex = 0;
 
-// WIFI CONFIG
-const char* WIFI_SSID = "Freitas";
-const char* WIFI_PASS = "2512Jesus";
+WiFiMulti wifiMulti;
 const char* SUPABASE_URL = "https://pthfxmypcxqjfstqwokf.supabase.co/rest/v1/hrv_sessions";
 const char* SUPABASE_KEY = "sb_publishable_V4ZrfeZNld9VROJOWZcE_w_N93BHvqd";
+
+// BLE Standard Nordic UART Service (NUS)
+BLEServer *pServer = NULL;
+BLECharacteristic *pTxCharacteristic = NULL; // For sending to phone
+BLECharacteristic *pRxCharacteristic = NULL; // For receiving from phone
+bool deviceConnected = false;
+
+#define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
 
 // RR Intervals
@@ -87,8 +100,8 @@ const char* USER_FILE = "/user_config.txt";
 int sessionNumber = 0;
 String currentUserName = "Visitante";
 String currentSessionTags = "";
-int currentSessionAge = 0;
-String currentSessionGender = "";
+int currentSessionAge = 0;       // 0 = Não informado
+String currentSessionGender = ""; // "" = Não informado
 
 void loadUserConfig() {
   if (SPIFFS.exists(USER_FILE)) {
@@ -157,24 +170,47 @@ bool rrAvgFull = false;
 // WIFI & UPLOAD
 // ============================================
 void connectWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return;
+  if (wifiMulti.run() == WL_CONNECTED) return;
   
-  Serial.print("Conectando ao WiFi: ");
-  Serial.println(WIFI_SSID);
-  
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  
+  Serial.println("\n--- WiFi: Iniciando conexao Multi ---");
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 5);
+  display.println("Conectando WiFi...");
+  display.setCursor(0, 20);
+  display.println("Redes salvas:");
+  display.println("- Freitas");
+  display.println("- M54 (Celular)");
+  display.display();
+
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+  while (wifiMulti.run() != WL_CONNECTED && attempts < 40) {
     delay(500);
     Serial.print(".");
+    if (attempts % 10 == 0 && attempts > 0) {
+      Serial.print("[Status: "); 
+      Serial.print(WiFi.status()); 
+      Serial.println("]");
+    }
     attempts++;
   }
   
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println(" OK!");
+    Serial.println("\nOK! Conectado a: " + WiFi.SSID());
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+    display.setCursor(0, 50);
+    display.println("OK: " + WiFi.SSID());
+    display.display();
+    delay(1000);
   } else {
-    Serial.println(" Falha! Verifique o sinal.");
+    Serial.println("\nFalha após 20 segundos.");
+    Serial.print("Status final: "); Serial.println(WiFi.status());
+    // 1 = WL_NO_SSID_AVAIL, 4 = WL_CONNECT_FAILED, 6 = WL_DISCONNECTED
+    display.setCursor(0, 50);
+    display.print("Erro WiFi:");
+    display.println(WiFi.status());
+    display.display();
+    delay(3000);
   }
 }
 
@@ -243,7 +279,7 @@ void uploadSession(HRVSession *s) {
   } else {
     sendChunk(client, "\"tags\": null,");
   }
-
+  
   if (currentSessionAge > 0) {
     sendChunk(client, "\"user_age\": " + String(currentSessionAge) + ",");
   } else {
@@ -321,7 +357,12 @@ void uploadSession(HRVSession *s) {
     }
   }
   client.stop();
-  currentSessionTags = ""; // Reset tags after successful session upload
+  currentSessionTags = ""; // Reset tags after successful session upload (One-shot)
+  
+  display.setCursor(0, 50);
+  display.println("Upload OK!");
+  display.display();
+  delay(1000);
 }
 
 void initSPIFFS() {
@@ -486,7 +527,12 @@ void resetDetection() {
   rmssd = sdnn = pnn50 = meanHR = 0;
 }
 
-// BLE removed for stability
+void sendBleResponse(String msg) {
+  if (deviceConnected && pTxCharacteristic) {
+    pTxCharacteristic->setValue(msg.c_str());
+    pTxCharacteristic->notify();
+  }
+}
 
 void processCommand(String input) {
   // Support for multiple commands in one string (e.g. from a macro)
@@ -553,8 +599,32 @@ void processSingleCommand(String input) {
   
   if (response.length() > 0) {
     Serial.println(response);
+    sendBleResponse(response);
   }
 }
+
+// BLE Callbacks
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+      Serial.println("BLE: Smartphone conectado!");
+    };
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      Serial.println("BLE: Smartphone desconectado!");
+      pServer->getAdvertising()->start();
+    }
+};
+
+class MyCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      String value = pCharacteristic->getValue().c_str();
+      if (value.length() > 0) {
+        Serial.print("BLE Recebido: "); Serial.println(value);
+        processCommand(value);
+      }
+    }
+};
 
 // ============================================
 // SETUP
@@ -563,10 +633,43 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   
-  // WiFi
+  // WiFi & Connectivity
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(100);
+  
+  wifiMulti.addAP("Freitas", "2512Jesus");
+  wifiMulti.addAP("M54", "bazinga@"); // Roteador do celular
+  
+  // BLE Nordic UART Service (NUS)
+  BLEDevice::init("PulseAnalytics");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  // TX Characteristic (Notify)
+  pTxCharacteristic = pService->createCharacteristic(
+                        CHARACTERISTIC_UUID_TX,
+                        BLECharacteristic::PROPERTY_NOTIFY
+                      );
+  pTxCharacteristic->addDescriptor(new BLE2902());
+
+  // RX Characteristic (Write)
+  pRxCharacteristic = pService->createCharacteristic(
+                        CHARACTERISTIC_UUID_RX,
+                        BLECharacteristic::PROPERTY_WRITE
+                      );
+  pRxCharacteristic->setCallbacks(new MyCallbacks());
+
+  pService->start();
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true); // Required for some phones
+  pAdvertising->setMinPreferred(0x06); 
+  BLEDevice::startAdvertising();
+  Serial.println("BLE Pronto (Nordic NUS)! Use: Nordic nRF profile no app.");
+
   bootTime = millis();
   
   Serial.println("\n============================================");

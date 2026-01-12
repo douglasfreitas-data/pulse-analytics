@@ -1,69 +1,48 @@
-# Pulse Analytics 🫀
+🫀 Pulse S3: Raw Bio-Signal Analytics
+Sistema de monitoramento cardíaco de alta performance baseado em ESP32-S3, focado na coleta de sinais brutos (PPG) para análise de HRV (Variabilidade da Frequência Cardíaca) e desenvolvimento de modelos de Machine Learning.
 
-**Sistema IoT de monitoramento cardíaco e análise de variabilidade da frequência cardíaca (HRV) para validação de algoritmos e predição de estados de fadiga/estresse.**
+O diferencial deste projeto é a coleta simultânea de três canais ópticos (Red, IR, Green) para superar as limitações de ruído em dispositivos portáteis.
 
-> Projeto de pesquisa e desenvolvimento que combina hardware (ESP32), processamento de sinais e ciência de dados para criar ground truth de métricas cardíacas.
+🚀 O Diferencial Tecnológico
+1. Coleta Multicanal (O Segredo do LED Verde)
+Diferente de oxímetros comuns, este sistema utiliza o LED verde do MAX30105. O sinal verde possui menor profundidade de penetração na pele, sendo drasticamente mais resistente a artefatos de movimento e ruídos basais que o Infravermelho.
 
----
+2. Pipeline de Dados: Do Hardware ao Modelo
+O projeto não se limita ao cálculo de BPM em tempo real. Ele funciona como um coletor de Ground Truth:
 
-## 🎯 Propósito
+Edge: ESP32-S3 captura waveforms brutos (Raw PPG).
 
-Estabelecer **"verdade terrestre" (ground truth)** para validação de dispositivos comerciais de oximetria de pulso através de:
+Bridge: Integração direta com Supabase via REST API.
 
-- Coleta de sinais PPG de alta precisão (400Hz+)
-- Validação estatística de métricas HRV (RMSSD, SDNN, pNN50)
-- Desenvolvimento e teste de algoritmos de detecção de picos R
-- Análise preditiva de estados de estresse e fadiga
+Analytics: Processamento em Python (Jupyter) para limpeza de sinais e extração de métricas de HRV com precisão clínica.
 
----
+🔬 Metodologia de Data Science
+Para evitar erros comuns (como os falsos batimentos de 179 BPM), o pipeline de processamento utiliza:
 
-## 🔬 Foco: Ciência de Dados
+Filtragem Digital: Aplicação de filtros Butterworth Bandpass (0.5Hz - 4Hz) para isolar a frequência cardíaca humana.
 
-Este projeto prioriza **rigor científico e análise de dados** sobre interface de usuário.
+Deteção de Picos: Algoritmos baseados em morfologia de onda (Nó Dicrótico vs. Pico Sistólico).
 
-### Pipeline de Dados
-```
-[ESP32 + MAX30105] → [Coleta 400Hz] → [Filtragem] → [Detecção Picos] 
-→ [Cálculo HRV] → [Validação Estatística] → [Ground Truth]
-```
+Métricas de HRV: Extração de RMSSD, SDNN e pNN50 diretamente das séries temporais filtradas.
 
-### Análises Realizadas
+🛠️ Stack Técnica
+Microcontrolador: ESP32-S3 (Dual-Core, AI Acceleration).
 
-- **Validação contra dispositivo referência** (Polar H10)
-- **Análise de acurácia** de algoritmos de detecção
-- **Processamento de sinais** (filtros Butterworth, remoção de artefatos)
-- **Correlação HRV × Estados fisiológicos**
-- **Modelos preditivos** de estresse/fadiga
+Sensor: MAX30105 (High-Sensitivity Optical Sensor).
 
----
+Backend: Supabase (PostgreSQL + Real-time).
 
-## 🛠️ Stack
+Análise: Python (Pandas, SciPy, NeuroKit2).
 
-### Hardware
-- **ESP32** (Dev Module / S3)
-- **MAX30105** (sensor PPG de alta resolução)
+Display: OLED 128x64 (Interface de status).
 
-### Firmware (Coleta)
-- **C++** (Arduino/ESP-IDF)
-- Taxa de amostragem: 400Hz+
-- Transmissão serial de dados brutos
+📈 Próximos Passos (Roadmap)
+[ ] Data Stream: Implementar o envio de arrays de 60 segundos de green_waveform para o Supabase.
 
-### Data Science (Análise) ⭐
-- **Python** | Pandas | NumPy | SciPy | Scikit-learn
-- **Jupyter Notebooks** (análise exploratória)
-- **Matplotlib/Seaborn** (visualização de sinais)
-- **Algoritmos**: Pan-Tompkins, filtros adaptativos
+[ ] AI Refinement: Treinar modelo em Python para detecção automática de outliers no intervalo RR.
 
----
+[ ] Edge AI: Portar o modelo filtrado para o ESP32-S3 usando TensorFlow Lite Micro.
 
-## 📊 Datasets
-
-- **10.000+ intervalos RR** coletados e anotados
-- **Ground truth** validado contra Polar H10
-- **Análise de erro**: MAE < 5ms em detecção de picos
-- **Casos de uso**: repouso, exercício, recuperação
-
----
 
 ## 📂 Estrutura
 ```

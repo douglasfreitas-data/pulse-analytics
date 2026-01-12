@@ -19,6 +19,10 @@ CREATE TABLE IF NOT EXISTS hrv_sessions (
     pnn50 FLOAT,
     rr_valid_count INT,
     
+    -- Demographics
+    user_age SMALLINT,
+    user_gender TEXT,
+    
     -- Context
     tags TEXT[], -- Array of strings e.g. ['post-workout', 'resting']
     
