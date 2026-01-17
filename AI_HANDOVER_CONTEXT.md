@@ -10,10 +10,10 @@
 
 ## 🛠️ Hardware Stack
 - **Microcontroller:** ESP32 (Dev Module / S3)
-- **Sensor:** MAX30105 (High-Sensitivity Pulse Oximeter & Heart-Rate Sensor)
-- **Communication:** Serial/UART for data logging, potentially Bluetooth/BLE for App connection.
-- **Sampling Rate Target:** 200Hz-400Hz.
-- **Session Duration:** 120 seconds (24,000 samples per channel).
+- **Sensor:** MAX30102 (Red + IR apenas, NÃO possui LED Verde)
+- **Communication:** Serial/UART for data logging.
+- **Sampling Rate Target:** 400Hz.
+- **Session Duration:** 60-300 seconds.
 
 ## 📂 Repository Structure
 - **/firmware:** Contains the C++ source code for the ESP32.
@@ -27,14 +27,15 @@
 4.  **Data Science Pipeline:** Create a seamless flow to dump raw PPG data from the ESP32 to Python validation scripts.
 
 ## 📝 Current Status & History
-- **Refactoring:** The project was recently extracted from a larger monorepo to focus purely on the "Hard Tech" aspects.
+- **IMPORTANTE:** Sensor é MAX30102 (não MAX30105). Não possui LED Verde!
 - **Version History Summary:**
     - **v1-v4:** Basic heart rate detection and local display experiments.
-    - **v5:** Introduced local logging to SPIFFS and multiple session management. Proved to be stable but lacked high-fidelity raw data upload.
-    - **v6_DS (Initial):** Focused on "Data Science" (3-channel raw data upload to Supabase). Encountered RAM issues (fixed via Chunked Upload) and BPM inaccuracies.
-    - **v6_DS (Current Fix):** Identified and resolved "Sampling Jitter". Moved from `loop()`-based reading to a rigid isochronous `micros()` guard (200Hz). Added **Live Tagging** support.
-- **Immediate Challenge:** Starting a clean data collection campaign with precise timing and contextual tags.
-- **Database Status:** Full backup of legacy data stored in `docs/backups/`. Supabase table reset for a fresh start.
+    - **v5:** Introduced local logging to SPIFFS and multiple session management.
+    - **v6_DS:** 3-channel upload to Supabase. Chunked Upload for RAM issues.
+    - **v7_green:** OBSOLETO - Tentativa de usar Green LED (sensor não suporta).
+    - **v8_cloud:** MAX30102 Red+IR @ 400Hz. Buffer local + upload Supabase.
+- **Current Focus:** Validar taxa de 400Hz com Red+IR.
+- **Database Status:** Usando `hrv_sessions` existente.
 
 ## 🤖 Instructions for the Next AI Agent
 1.  **Read this file first.**
