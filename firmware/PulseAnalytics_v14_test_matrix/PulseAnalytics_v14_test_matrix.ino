@@ -1,22 +1,21 @@
 /**
  * ============================================
- * PULSE ANALYTICS v8.0 - CLOUD STORAGE
+ * PULSE ANALYTICS v14.0 - TEST MATRIX
  * ============================================
  * 
- * SENSOR: MAX30102 (Red + IR apenas, sem Green)
- * FOCO: Coleta de alta frequência para análise offline
+ * OBJETIVO: Encontrar a configuração ideal para 800Hz
+ * após perda de qualidade por atualização sem backup.
  * 
- * Configuração:
- * - LED Mode: 2 (Red + IR)
- * - Sample Rate: 400Hz
- * - Pulse Width: 69μs (15-bit ADC)
- * - Sample Average: 1 (sem média)
- * - I2C: 400kHz Fast Mode
+ * METODOLOGIA:
+ * - 12 configurações pré-definidas
+ * - Coletas curtas de 10 segundos
+ * - Upload separado para cada teste
+ * - Tags automáticas para identificação
  * 
- * Estratégia:
- * - Buffer local para 300 segundos
- * - Upload único no final (mais seguro para WiFi instável)
- * - Sem cálculos de BPM/SpO2 (feito offline)
+ * COMANDOS:
+ * - test1 a test12: Executar teste específico
+ * - auto: Executar todos os testes sequencialmente
+ * - status: Ver configuração atual
  */
 
 #include <Wire.h>
@@ -42,26 +41,55 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 MAX30105 particleSensor;
 
 // ============================================
-// CONFIGURAÇÕES v8.0
+// MATRIZ DE CONFIGURAÇÕES PARA 800Hz
 // ============================================
+struct SensorConfig {
+  int pulseWidth;      // 69, 118, 215 (compatíveis com 800Hz)
+  int adcRange;        // 4096, 8192, 16384
+  byte ledBrightness;  // 0x00 - 0xFF
+  byte irAmplitude;    // 0x00 - 0xFF
+  byte redAmplitude;   // 0x00 - 0xFF
+  const char* name;    // Nome para tag
+};
 
-// Buffer para 300 segundos @ 400Hz = 120.000 amostras
-// ATENÇÃO: ESP32-S3 tem ~320KB de RAM disponível
-// 2 buffers x 120000 x 2 bytes = 480KB (MUITO!)
-// Solução: usar buffer menor ou compressão
+// 12 configurações de teste
+const SensorConfig TEST_CONFIGS[] = {
+  // Testes com pulseWidth 69μs (15-bit ADC, mais rápido)
+  { 69, 4096,  0x7F, 0x7F, 0x7F, "T01_PW69_ADC4K" },
+  { 69, 8192,  0x7F, 0x7F, 0x7F, "T02_PW69_ADC8K" },
+  { 69, 16384, 0x7F, 0x7F, 0x7F, "T03_PW69_ADC16K" },
+  
+  // Testes com pulseWidth 118μs (16-bit ADC, equilíbrio)
+  { 118, 4096,  0x7F, 0x7F, 0x7F, "T04_PW118_ADC4K" },
+  { 118, 8192,  0x7F, 0x7F, 0x7F, "T05_PW118_ADC8K" },
+  { 118, 16384, 0x7F, 0x7F, 0x7F, "T06_PW118_ADC16K" },
+  
+  // Testes com pulseWidth 215μs (17-bit ADC, máximo para 800Hz)
+  { 215, 4096,  0x7F, 0x7F, 0x7F, "T07_PW215_ADC4K" },
+  { 215, 8192,  0x7F, 0x7F, 0x7F, "T08_PW215_ADC8K" },
+  { 215, 16384, 0x7F, 0x7F, 0x7F, "T09_PW215_ADC16K" },
+  
+  // Variações de amplitude (baseadas na Session 18)
+  { 215, 16384, 0x7F, 0x70, 0x7F, "T10_Session18_Ref" },  // REFERÊNCIA!
+  { 215, 16384, 0xFF, 0x7F, 0x7F, "T11_LED_MAX" },
+  { 215, 16384, 0x50, 0x50, 0x50, "T12_LED_LOW" },
+};
 
-// Buffer otimizado: 50 segundos @ 800Hz = 40.000 amostras
-// RAM Req: 40k * 2ch * 2 bytes = 160KB. (Libera 32KB para SSL)
-const int BUFFER_SIZE = 40000;
+const int NUM_CONFIGS = 12;
+int currentTestIndex = -1;  // -1 = nenhum teste ativo
+
+// ============================================
+// BUFFER (menor para testes rápidos)
+// ============================================
+// 10 segundos @ 800Hz = 8.000 amostras
+const int BUFFER_SIZE = 10000;
 uint16_t irBuffer[BUFFER_SIZE];
 uint16_t redBuffer[BUFFER_SIZE];
 int bufferIndex = 0;
 
 // Timing
 const int SAMPLE_RATE_HZ = 800;
-const unsigned long SAMPLE_INTERVAL_US = 1250;  // 1000000 / 800 = 1250μs
-const unsigned long SAMPLE_DURATION_MS = 50000; // 50 segundos
-// TODO: Aumentar para 300000 (5 min) após validar taxa
+const unsigned long SAMPLE_DURATION_MS = 10000; // 10 segundos por teste
 
 unsigned long sampleStartTime = 0;
 unsigned long bootTime = 0;
@@ -74,7 +102,7 @@ const char* SUPABASE_KEY = "sb_publishable_V4ZrfeZNld9VROJOWZcE_w_N93BHvqd";
 
 // Sessão
 int sessionNumber = 0;
-String currentUserName = "Visitante";
+String currentUserName = "TestMatrix";
 String currentSessionTags = "";
 int currentSessionAge = 0;
 String currentSessionGender = "";
@@ -84,9 +112,68 @@ enum DeviceState {
   WAITING_BUTTON,
   COLLECTING,
   UPLOADING,
-  UPLOAD_FAIL
+  UPLOAD_FAIL,
+  AUTO_MODE
 };
 DeviceState currentState = WAITING_BUTTON;
+
+// Auto mode
+bool autoModeActive = false;
+int autoModeCurrentTest = 0;
+
+// ============================================
+// APLICAR CONFIGURAÇÃO DO SENSOR
+// ============================================
+void applySensorConfig(int testIndex) {
+  if (testIndex < 0 || testIndex >= NUM_CONFIGS) {
+    Serial.println("Índice de teste inválido!");
+    return;
+  }
+  
+  SensorConfig cfg = TEST_CONFIGS[testIndex];
+  
+  Serial.println("\n========================================");
+  Serial.print("   APLICANDO CONFIG: ");
+  Serial.println(cfg.name);
+  Serial.println("========================================");
+  Serial.print("   pulseWidth: "); Serial.println(cfg.pulseWidth);
+  Serial.print("   adcRange: "); Serial.println(cfg.adcRange);
+  Serial.print("   ledBrightness: 0x"); Serial.println(cfg.ledBrightness, HEX);
+  Serial.print("   IR Amplitude: 0x"); Serial.println(cfg.irAmplitude, HEX);
+  Serial.print("   Red Amplitude: 0x"); Serial.println(cfg.redAmplitude, HEX);
+  Serial.println("========================================\n");
+  
+  // Configurar sensor
+  byte sampleAverage = 1;  // Sempre 1 para 800Hz
+  byte ledMode = 2;        // Red + IR
+  int sampleRate = 800;    // Fixo em 800Hz
+  
+  particleSensor.setup(cfg.ledBrightness, sampleAverage, ledMode, sampleRate, cfg.pulseWidth, cfg.adcRange);
+  particleSensor.setPulseAmplitudeRed(cfg.redAmplitude);
+  particleSensor.setPulseAmplitudeIR(cfg.irAmplitude);
+  particleSensor.clearFIFO();
+  
+  // Definir tag automática
+  currentSessionTags = String(cfg.name);
+  currentTestIndex = testIndex;
+  
+  // Mostrar no display
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("CONFIG APLICADA:");
+  display.setCursor(0, 15);
+  display.println(cfg.name);
+  display.setCursor(0, 30);
+  display.print("PW:"); display.print(cfg.pulseWidth);
+  display.print(" ADC:"); display.println(cfg.adcRange);
+  display.setCursor(0, 45);
+  display.print("LED:0x"); display.print(cfg.ledBrightness, HEX);
+  display.print(" IR:0x"); display.println(cfg.irAmplitude, HEX);
+  display.display();
+  
+  delay(1500);
+}
 
 // ============================================
 // WiFi & UPLOAD
@@ -140,13 +227,12 @@ void uploadRawData() {
   display.print(bufferIndex);
   display.println(" amostras");
   display.setCursor(0, 40);
-  display.println("Aguarde...");
+  display.println(currentSessionTags);
   display.display();
   
   Serial.println(ESP.getFreeHeap());
   
-  // AUMENTAR TIMEOUT PARA 60 SEGUNDOS (Vital para 160KB)
-  client.setTimeout(60000); 
+  client.setTimeout(30000); // 30s timeout (dados menores)
 
   if (!client.connect(host, 443)) {
     Serial.print("Erro HTTPS! Heap: ");
@@ -154,7 +240,7 @@ void uploadRawData() {
     display.setCursor(0, 55);
     display.println("ERRO HTTPS!");
     display.display();
-    currentState = UPLOAD_FAIL; // Permite retry
+    currentState = UPLOAD_FAIL;
     return;
   }
   
@@ -169,42 +255,29 @@ void uploadRawData() {
   client.println("Connection: close");
   client.println();
   
-  // JSON - Estrutura simplificada para v8.0
+  // JSON
   sendChunk(client, "{");
-  sendChunk(client, "\"device_id\": \"ESP32-S3-v11-800Hz\",");
+  sendChunk(client, "\"device_id\": \"ESP32-S3-v14-TestMatrix\",");
   sendChunk(client, "\"user_name\": \"" + currentUserName + "\",");
   sendChunk(client, "\"sampling_rate_hz\": " + String(SAMPLE_RATE_HZ) + ",");
   sendChunk(client, "\"session_index\": " + String(sessionNumber) + ",");
   sendChunk(client, "\"timestamp_device_min\": " + String((millis() - bootTime) / 60000) + ",");
   
-  // Métricas null (serão calculadas offline)
+  // Métricas null
   sendChunk(client, "\"fc_mean\": null,");
   sendChunk(client, "\"sdnn\": null,");
   sendChunk(client, "\"rmssd\": null,");
   sendChunk(client, "\"pnn50\": null,");
   sendChunk(client, "\"rr_valid_count\": null,");
   sendChunk(client, "\"rrr_intervals_ms\": null,");
-  sendChunk(client, "\"green_waveform\": null,");  // MAX30102 não tem Green
+  sendChunk(client, "\"green_waveform\": null,");
   
-  // Tags
-  if (currentSessionTags.length() > 0) {
-    sendChunk(client, "\"tags\": [\"" + currentSessionTags + "\"],");
-  } else {
-    sendChunk(client, "\"tags\": null,");
-  }
+  // Tags (nome da configuração)
+  sendChunk(client, "\"tags\": [\"" + currentSessionTags + "\"],");
   
   // Demographics
-  if (currentSessionAge > 0) {
-    sendChunk(client, "\"user_age\": " + String(currentSessionAge) + ",");
-  } else {
-    sendChunk(client, "\"user_age\": null,");
-  }
-  
-  if (currentSessionGender.length() > 0) {
-    sendChunk(client, "\"user_gender\": \"" + currentSessionGender + "\",");
-  } else {
-    sendChunk(client, "\"user_gender\": null,");
-  }
+  sendChunk(client, "\"user_age\": null,");
+  sendChunk(client, "\"user_gender\": null,");
   
   // IR WAVEFORM
   Serial.println("Enviando IR waveform...");
@@ -214,30 +287,20 @@ void uploadRawData() {
     irBuf += String(irBuffer[i]);
     if (i < bufferIndex - 1) irBuf += ",";
     
-    // Flush buffer a cada 200 valores
     if ((i + 1) % 200 == 0 || i == bufferIndex - 1) {
       sendChunk(client, irBuf);
       irBuf = "";
-      
-      // CRÍTICO: yield() para evitar watchdog reset
       yield();
       
       if (!client.connected()) {
         Serial.println("ERRO: Conexão perdida durante upload IR!");
-        currentState = UPLOAD_FAIL; // Permite retry
+        currentState = UPLOAD_FAIL;
         return;
       }
       
-      // Progress a cada 2000 valores
       if ((i + 1) % 2000 == 0) {
         int pct = (i * 50) / bufferIndex;
         Serial.print("IR: "); Serial.print(pct); Serial.println("%");
-        display.clearDisplay();
-        display.setCursor(0, 20);
-        display.println("Enviando IR...");
-        display.setCursor(0, 35);
-        display.print(pct); display.println("%");
-        display.display();
       }
     }
   }
@@ -252,30 +315,20 @@ void uploadRawData() {
     redBuf += String(redBuffer[i]);
     if (i < bufferIndex - 1) redBuf += ",";
     
-    // Flush buffer a cada 200 valores
     if ((i + 1) % 200 == 0 || i == bufferIndex - 1) {
       sendChunk(client, redBuf);
       redBuf = "";
-      
-      // CRÍTICO: yield() para evitar watchdog reset
       yield();
       
       if (!client.connected()) {
         Serial.println("ERRO: Conexão perdida durante upload RED!");
-        currentState = UPLOAD_FAIL; // Permite retry
+        currentState = UPLOAD_FAIL;
         return;
       }
       
-      // Progress a cada 2000 valores
       if ((i + 1) % 2000 == 0) {
         int pct = 50 + (i * 50) / bufferIndex;
         Serial.print("Red: "); Serial.print(pct); Serial.println("%");
-        display.clearDisplay();
-        display.setCursor(0, 20);
-        display.println("Enviando Red...");
-        display.setCursor(0, 35);
-        display.print(pct); display.println("%");
-        display.display();
       }
     }
   }
@@ -308,9 +361,13 @@ void uploadRawData() {
   // Resultado
   display.clearDisplay();
   display.setTextSize(2);
-  display.setCursor(10, 20);
+  display.setCursor(10, 10);
   if (success) {
     display.println("SUCESSO!");
+    display.setTextSize(1);
+    display.setCursor(0, 35);
+    display.println(currentSessionTags);
+  } else {
     display.println("ERRO!");
   }
   display.setTextSize(1);
@@ -319,12 +376,13 @@ void uploadRawData() {
   display.println(" amostras");
   display.display();
   
-  currentSessionTags = "";  // Reset tag após upload
-  
   if (success) {
-    currentState = WAITING_BUTTON;
+    if (autoModeActive) {
+      currentState = AUTO_MODE;
+    } else {
+      currentState = WAITING_BUTTON;
+    }
   } else {
-    // Se falhar e não for desconexão (ex: HTTP 400), também permite retry
     currentState = UPLOAD_FAIL;
   }
 }
@@ -339,17 +397,6 @@ void initSPIFFS() {
   }
   Serial.println("SPIFFS OK");
   
-  // Carregar user
-  if (SPIFFS.exists("/user_config.txt")) {
-    File file = SPIFFS.open("/user_config.txt", "r");
-    if (file) {
-      String line = file.readStringUntil('\n');
-      line.trim();
-      if (line.length() > 0) currentUserName = line;
-      file.close();
-    }
-  }
-  
   // Contar sessões
   if (SPIFFS.exists("/session_count.txt")) {
     File file = SPIFFS.open("/session_count.txt", "r");
@@ -359,7 +406,6 @@ void initSPIFFS() {
     }
   }
   
-  Serial.print("Usuario: "); Serial.println(currentUserName);
   Serial.print("Sessoes: "); Serial.println(sessionNumber);
 }
 
@@ -376,75 +422,70 @@ void saveSessionCount() {
 // ============================================
 void processCommand(String cmd) {
   cmd.trim();
+  cmd.toLowerCase();
   
-  if (cmd.equalsIgnoreCase("start") || cmd.equalsIgnoreCase("s")) {
-    if (currentState == WAITING_BUTTON) {
+  // Testes individuais: test1 a test12
+  if (cmd.startsWith("test")) {
+    int testNum = cmd.substring(4).toInt();
+    if (testNum >= 1 && testNum <= NUM_CONFIGS) {
+      applySensorConfig(testNum - 1);
+      startCollection();
+    } else {
+      Serial.println("Teste inválido! Use test1 a test12");
+    }
+  }
+  // Atalhos t1 a t12
+  else if (cmd.length() >= 2 && cmd.charAt(0) == 't' && isDigit(cmd.charAt(1))) {
+    int testNum = cmd.substring(1).toInt();
+    if (testNum >= 1 && testNum <= NUM_CONFIGS) {
+      applySensorConfig(testNum - 1);
       startCollection();
     }
   }
-  else if (cmd.equalsIgnoreCase("c")) {
-    // Resetar contador de sessões
-    sessionNumber = 0;
-    saveSessionCount();
-    Serial.println("Sessoes resetadas para 0!");
+  // Auto mode
+  else if (cmd == "auto" || cmd == "a") {
+    Serial.println("\n========================================");
+    Serial.println("   MODO AUTOMÁTICO INICIADO!");
+    Serial.println("   Executando todos os 12 testes...");
+    Serial.println("========================================\n");
+    autoModeActive = true;
+    autoModeCurrentTest = 0;
+    currentState = AUTO_MODE;
   }
-  else if (cmd.equalsIgnoreCase("retry") || cmd.equalsIgnoreCase("r")) {
+  // Configurações
+  else if (cmd == "configs" || cmd == "c") {
+    Serial.println("\n========================================");
+    Serial.println("   MATRIZ DE CONFIGURAÇÕES (800Hz)");
+    Serial.println("========================================");
+    for (int i = 0; i < NUM_CONFIGS; i++) {
+      Serial.print(i + 1); Serial.print(". ");
+      Serial.print(TEST_CONFIGS[i].name);
+      Serial.print(" | PW:"); Serial.print(TEST_CONFIGS[i].pulseWidth);
+      Serial.print(" ADC:"); Serial.print(TEST_CONFIGS[i].adcRange);
+      Serial.print(" LED:0x"); Serial.print(TEST_CONFIGS[i].ledBrightness, HEX);
+      Serial.print(" IR:0x"); Serial.println(TEST_CONFIGS[i].irAmplitude, HEX);
+    }
+    Serial.println("========================================\n");
+  }
+  // Retry
+  else if (cmd == "retry" || cmd == "r") {
     if (currentState == UPLOAD_FAIL) {
-      Serial.println("Retentando upload (Timeout estendido por 60s)...");
+      Serial.println("Retentando upload...");
       currentState = UPLOADING;
-    } else {
-      Serial.println("Nada para reenviar.");
     }
   }
-  else if (cmd.equalsIgnoreCase("l")) {
-    // Log de status
-    Serial.println("\n=== LOG ===");
-    Serial.print("Sessoes realizadas: "); Serial.println(sessionNumber);
-    Serial.print("Usuario: "); Serial.println(currentUserName);
-    Serial.println("===========\n");
-  }
-  else if (cmd.startsWith("USER:") || cmd.startsWith("user:")) {
-    currentUserName = cmd.substring(5);
-    currentUserName.trim();
-    File file = SPIFFS.open("/user_config.txt", "w");
-    if (file) { file.println(currentUserName); file.close(); }
-    Serial.print("Usuario: "); Serial.println(currentUserName);
-  }
-  else if (cmd.startsWith("TAG:") || cmd.startsWith("tag:")) {
-    currentSessionTags = cmd.substring(4);
-    currentSessionTags.trim();
-    Serial.print("Tag: "); Serial.println(currentSessionTags);
-  }
-  else if (cmd.startsWith("AGE:") || cmd.startsWith("age:")) {
-    currentSessionAge = cmd.substring(4).toInt();
-    Serial.print("Idade: "); Serial.println(currentSessionAge);
-  }
-  else if (cmd.startsWith("SEX:") || cmd.startsWith("sex:")) {
-    currentSessionGender = cmd.substring(4);
-    currentSessionGender.trim();
-    Serial.print("Sexo: "); Serial.println(currentSessionGender);
-  }
-  else if (cmd.equalsIgnoreCase("status")) {
-    Serial.println("\n=== STATUS v8.0 ===");
-    Serial.print("Usuario: "); Serial.println(currentUserName);
-    Serial.print("Sessoes: "); Serial.println(sessionNumber);
-    Serial.print("Estado: "); Serial.println(currentState == WAITING_BUTTON ? "AGUARDANDO" : "COLETANDO");
-    Serial.print("Buffer: "); Serial.print(BUFFER_SIZE); Serial.println(" max");
-    Serial.print("Taxa: "); Serial.print(SAMPLE_RATE_HZ); Serial.println(" Hz");
-    Serial.print("Duracao: "); Serial.print(SAMPLE_DURATION_MS/1000); Serial.println(" seg");
-    Serial.println("===================\n");
-  }
-  else if (cmd.equalsIgnoreCase("help") || cmd.equalsIgnoreCase("h")) {
-    Serial.println("\n=== COMANDOS v8.0 ===");
-    Serial.println("start / s    - Iniciar coleta");
-    Serial.println("c            - Resetar sessoes");
-    Serial.println("l            - Ver log/status");
-    Serial.println("USER:nome    - Definir usuario");
-    Serial.println("TAG:tag      - Definir tag da sessao");
-    Serial.println("AGE:idade    - Definir idade");
-    Serial.println("SEX:m/f      - Definir sexo");
-    Serial.println("status       - Ver status detalhado");
-    Serial.println("=====================\n");
+  // Help
+  else if (cmd == "help" || cmd == "h") {
+    Serial.println("\n========================================");
+    Serial.println("   COMANDOS v14 - TEST MATRIX");
+    Serial.println("========================================");
+    Serial.println("test1-test12  Executar teste específico");
+    Serial.println("t1-t12        Atalho para testes");
+    Serial.println("auto / a      Executar todos os testes");
+    Serial.println("configs / c   Listar configurações");
+    Serial.println("retry / r     Reenviar upload falho");
+    Serial.println("help / h      Mostrar ajuda");
+    Serial.println("========================================\n");
   }
 }
 
@@ -461,38 +502,33 @@ void startCollection() {
   currentState = COLLECTING;
   sampleStartTime = millis();
   
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setCursor(0, 5);
-  display.println("COLETA");
-  display.setTextSize(1);
-  display.setCursor(0, 30);
-  display.print("Sessao #"); display.println(sessionNumber);
-  display.setCursor(0, 45);
-  display.println("Mantenha o dedo...");
-  display.display();
-  
   Serial.println("\n========================================");
-  Serial.print("   SESSAO #"); Serial.print(sessionNumber);
+  Serial.print("   TESTE "); Serial.print(currentTestIndex + 1);
+  Serial.print("/"); Serial.print(NUM_CONFIGS);
   Serial.println(" - COLETA INICIADA");
   Serial.println("========================================");
+  Serial.print("Config: "); Serial.println(currentSessionTags);
   Serial.print("Duracao: "); Serial.print(SAMPLE_DURATION_MS/1000); Serial.println(" segundos");
-  Serial.print("Taxa alvo: "); Serial.print(SAMPLE_RATE_HZ); Serial.println(" Hz");
   Serial.println("Mantenha o dedo no sensor...\n");
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("TESTE "); display.print(currentTestIndex + 1);
+  display.print("/"); display.println(NUM_CONFIGS);
+  display.setCursor(0, 15);
+  display.println(currentSessionTags);
+  display.setCursor(0, 35);
+  display.println("Mantenha o dedo...");
+  display.setCursor(0, 50);
+  display.print("10 segundos");
+  display.display();
 }
 
 void handleCollection() {
-  // ==============================================
-  // LEITURA DO FIFO - CRÍTICO PARA 800Hz
-  // ==============================================
-  // O sensor tem um FIFO interno de 32 amostras.
-  // A 800Hz, ele gera amostras a cada 1.25ms.
-  // Precisamos consumir o FIFO continuamente para não perder dados.
-  
-  // Verifica se há amostras disponíveis no FIFO
+  // Leitura do FIFO
   while (particleSensor.available()) {
     if (bufferIndex < BUFFER_SIZE) {
-      // Ler do FIFO (não do "último valor")
       uint32_t irValue = particleSensor.getFIFOIR();
       uint32_t redValue = particleSensor.getFIFORed();
       
@@ -500,15 +536,12 @@ void handleCollection() {
       redBuffer[bufferIndex] = (uint16_t)redValue;
       bufferIndex++;
       
-      // Avançar para próxima amostra no FIFO
       particleSensor.nextSample();
     } else {
-      // Buffer cheio, descartar amostra
       particleSensor.nextSample();
     }
   }
   
-  // Verificar se há mais dados aguardando no sensor
   particleSensor.check();
   
   // Atualizar display a cada segundo
@@ -523,7 +556,7 @@ void handleCollection() {
     
     display.clearDisplay();
     display.setTextSize(2);
-    display.setCursor(40, 5);
+    display.setCursor(50, 5);
     display.print(secondsRemaining);
     display.println("s");
     display.setTextSize(1);
@@ -532,15 +565,12 @@ void handleCollection() {
     display.setCursor(0, 42);
     display.print("Taxa: "); display.print((int)currentRate); display.println(" Hz");
     display.setCursor(0, 54);
-    display.print("Sessao #"); display.println(sessionNumber);
+    display.println(currentSessionTags);
     display.display();
     
-    // Log a cada 10 segundos
-    if ((elapsedMS / 1000) % 10 == 0) {
-      Serial.print("["); Serial.print(elapsedMS/1000); Serial.print("s] ");
-      Serial.print("Amostras: "); Serial.print(bufferIndex);
-      Serial.print(" | Taxa: "); Serial.print((int)currentRate); Serial.println(" Hz");
-    }
+    Serial.print("["); Serial.print(elapsedMS/1000); Serial.print("s] ");
+    Serial.print("Amostras: "); Serial.print(bufferIndex);
+    Serial.print(" | Taxa: "); Serial.print((int)currentRate); Serial.println(" Hz");
   }
   
   // Verificar se terminou
@@ -549,25 +579,24 @@ void handleCollection() {
     
     Serial.println("\n========================================");
     Serial.println("   COLETA CONCLUIDA!");
+    Serial.print("   Config: "); Serial.println(currentSessionTags);
     Serial.print("   Amostras: "); Serial.println(bufferIndex);
-    Serial.print("   Tempo: "); Serial.print(elapsedMS/1000); Serial.println(" seg");
     Serial.print("   Taxa Real: "); Serial.print(finalRate, 1); Serial.println(" Hz");
     Serial.println("========================================\n");
     
     display.clearDisplay();
-    display.setTextSize(2);
-    display.setCursor(10, 5);
-    display.println("PRONTO!");
     display.setTextSize(1);
-    display.setCursor(0, 30);
+    display.setCursor(0, 5);
+    display.println("COLETA OK!");
+    display.setCursor(0, 20);
+    display.println(currentSessionTags);
+    display.setCursor(0, 35);
     display.print("Amostras: "); display.println(bufferIndex);
-    display.setCursor(0, 42);
-    display.print("Taxa: "); display.print(finalRate, 1); display.println(" Hz");
-    display.setCursor(0, 54);
-    display.println("Enviando dados...");
+    display.setCursor(0, 50);
+    display.println("Enviando...");
     display.display();
     
-    delay(1000);
+    delay(500);
     currentState = UPLOADING;
   }
 }
@@ -576,27 +605,54 @@ void handleUploading() {
   uploadRawData();
   
   if (currentState == WAITING_BUTTON) {
-      delay(3000);
-      display.clearDisplay();
-      display.setCursor(0, 20);
-      display.println("Pronto para nova");
-      display.setCursor(0, 32);
-      display.println("medicao!");
-      display.setCursor(0, 50);
-      display.println("Digite 'start'");
-      display.display();
+    delay(2000);
+    showWaitingScreen();
   } else if (currentState == UPLOAD_FAIL) {
-      Serial.println("Falha no Upload. Digite 'retry' para tentar novamente.");
-      display.clearDisplay();
-      display.setTextSize(2);
-      display.setCursor(0, 10);
-      display.println("FALHA!");
-      display.setTextSize(1);
-      display.setCursor(0, 35);
-      display.println("Digite 'retry'");
-      display.println("para reenviar.");
-      display.display();
+    Serial.println("Falha no Upload. Digite 'retry' para tentar novamente.");
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 10);
+    display.println("FALHA UPLOAD!");
+    display.setCursor(0, 30);
+    display.println(currentSessionTags);
+    display.setCursor(0, 50);
+    display.println("Digite 'retry'");
+    display.display();
   }
+}
+
+void handleAutoMode() {
+  if (autoModeCurrentTest >= NUM_CONFIGS) {
+    // Todos os testes concluídos
+    Serial.println("\n========================================");
+    Serial.println("   MODO AUTOMÁTICO CONCLUÍDO!");
+    Serial.println("   Todos os 12 testes foram executados.");
+    Serial.println("========================================\n");
+    
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setCursor(0, 10);
+    display.println("COMPLETO!");
+    display.setTextSize(1);
+    display.setCursor(0, 35);
+    display.println("12/12 testes OK");
+    display.setCursor(0, 50);
+    display.println("Verifique Supabase");
+    display.display();
+    
+    autoModeActive = false;
+    currentState = WAITING_BUTTON;
+    return;
+  }
+  
+  Serial.print("\n>>> Auto Mode: Iniciando teste ");
+  Serial.print(autoModeCurrentTest + 1);
+  Serial.print("/");
+  Serial.println(NUM_CONFIGS);
+  
+  applySensorConfig(autoModeCurrentTest);
+  autoModeCurrentTest++;
+  startCollection();
 }
 
 void showWaitingScreen() {
@@ -607,33 +663,18 @@ void showWaitingScreen() {
   display.clearDisplay();
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.println("PulseAnalytics v11.0");
+  display.println("PulseAnalytics v14");
   display.setCursor(0, 12);
-  display.println("800Hz RESTORED");
+  display.println("TEST MATRIX 800Hz");
   display.setCursor(0, 28);
-  display.print("User: ");
-  display.println(currentUserName);
+  display.println("Comandos:");
   display.setCursor(0, 40);
+  display.println("t1-t12, auto, help");
+  display.setCursor(0, 54);
   display.print("Sessoes: ");
   display.println(sessionNumber);
-  display.setCursor(0, 54);
-  display.println("Serial: 'start'");
   display.display();
 }
-
-/**
- * PULSE ANALYTICS v11.0 - EXPERIMENTAL 800Hz
- * ============================================
- * 
- * BUFFER: RAM Tanker (40,000 samples @ 50s)
- * SENSOR: MAX30102 (Red + IR)
- * TAXA: 800 Hz (pulseWidth 215µs)
- * IR GAIN: 0x7F (Maximized for short integration time)
- * 
- * Estratégia:
- * - Buffer local para 50 segundos (RAM ~160KB)
- * - Safe for SSL (Heap available)
- */
 
 // ============================================
 // SETUP
@@ -647,13 +688,13 @@ void setup() {
   WiFi.disconnect();
   
   Serial.println("\n============================================");
-  Serial.println("   PULSE ANALYTICS v11.0 - 800Hz RESTORED");
-  Serial.println("   Sensor: MAX30102 (Red + IR) @ 800Hz");
+  Serial.println("   PULSE ANALYTICS v14.0 - TEST MATRIX");
+  Serial.println("   Matriz de testes para 800Hz");
   Serial.println("============================================");
-  Serial.println("Comandos: 'start', 'USER:nome', 'help'");
+  Serial.println("Comandos: test1-12, auto, configs, help");
   Serial.println("============================================\n");
   
-  // I2C 400kHz - CRÍTICO para 400Hz de amostragem
+  // I2C 400kHz
   Wire.begin();
   Wire.setClock(400000);
   
@@ -670,15 +711,15 @@ void setup() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 10);
-  display.println("PulseAnalytics v11");
+  display.println("PulseAnalytics v14");
   display.setCursor(0, 25);
-  display.println("800Hz RESTORED");
-  display.setCursor(0, 40);
+  display.println("TEST MATRIX");
+  display.setCursor(0, 45);
   display.println("Inicializando...");
   display.display();
   delay(1000);
   
-  // MAX30102/MAX30105 - CONFIG PARA 400Hz
+  // MAX30102 - Config inicial (T10 = Session 18)
   if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
     Serial.println("MAX30102 erro!");
     display.setCursor(0, 55);
@@ -687,45 +728,19 @@ void setup() {
     while (1);
   }
   
-  // FAXINA: Limpar estado do sensor após travamento
+  // ============================================
+  // FAXINA: Limpar estado do sensor
+  // ============================================
   Serial.println("Executando softReset()...");
   particleSensor.softReset();
-  delay(500);
+  delay(500);  // Tempo para o sensor se recuperar
   Serial.println("Sensor resetado!");
   
-  // ============================================
-  // CONFIGURAÇÃO PARA QUALIDADE DE SINAL PPG
-  // ============================================
-  // PROBLEMA ANTERIOR: pulseWidth=69 e adcRange=4096 davam sinal fraco
-  // CORREÇÃO: Usar valores da v6 que funcionavam bem
-  //
-  // NOTA: pulseWidth=411 limita sampleRate máximo a ~400Hz
-  // Isso é perfeito para nosso caso!
+  // Aplicar config padrão (Session 18)
+  applySensorConfig(9);  // T10 = índice 9
   
-  // Parâmetros extraídos da Session 18 (O que funcionou!)
-  byte ledBrightness = 0x7F;  // Brilho alto
-  byte sampleAverage = 1;     // Essencial para 800Hz
-  byte ledMode = 2;           // Red + IR
-  int sampleRate = 800;       
-  int pulseWidth = 215;       // O limite físico para 800Hz
-  int adcRange = 16384;       // 16-bit
-  
-  particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
-  
-  // Ajuste fino para o Indicador (Evita o "teto")
-  // Na Session 18, o IR em 0x70 foi a "Bala de Prata" contra a saturação
-  particleSensor.setPulseAmplitudeRed(0x7F);   
-  particleSensor.setPulseAmplitudeIR(0x70);    // SEGURANÇA para não bater no teto
-  
-  particleSensor.clearFIFO();
-  
-  Serial.println("Sensor configurado:");
-  Serial.print("  LED Mode: "); Serial.println(ledMode);
-  Serial.print("  Sample Rate: "); Serial.println(sampleRate);
-  Serial.print("  Pulse Width: "); Serial.println(pulseWidth);
-  Serial.print("  Sample Average: "); Serial.println(sampleAverage);
   Serial.println("\nSistema pronto!");
-  Serial.println("Digite 'start' para iniciar coleta.\n");
+  Serial.println("Digite 'help' para ver comandos.\n");
   
   currentState = WAITING_BUTTON;
 }
@@ -755,6 +770,10 @@ void loop() {
 
     case UPLOAD_FAIL:
       // Fica parado esperando comando 'retry'
+      break;
+      
+    case AUTO_MODE:
+      handleAutoMode();
       break;
   }
 }
