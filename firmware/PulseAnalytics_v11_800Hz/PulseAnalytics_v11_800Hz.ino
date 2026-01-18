@@ -702,8 +702,9 @@ void setup() {
   // NOTA: pulseWidth=411 limita sampleRate máximo a ~400Hz
   // Isso é perfeito para nosso caso!
   
-  // Parâmetros extraídos da Session 18 (O que funcionou!)
-  byte ledBrightness = 0x7F;  // Brilho alto
+  // Parâmetros otimizados pelo Teste Matrix (R08 vencedor)
+  // R08: Melhor entalhe dicrótico, SNR e estabilidade de linha base
+  byte ledBrightness = 0x90;  // LED alto (otimizado pelo teste matrix)
   byte sampleAverage = 1;     // Essencial para 800Hz
   byte ledMode = 2;           // Red + IR
   int sampleRate = 800;       
@@ -712,10 +713,10 @@ void setup() {
   
   particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
   
-  // Ajuste fino para o Indicador (Evita o "teto")
-  // Na Session 18, o IR em 0x70 foi a "Bala de Prata" contra a saturação
+  // Configuração R08 do Teste Matrix
+  // Melhor equilíbrio entre qualidade de sinal e consumo de energia
   particleSensor.setPulseAmplitudeRed(0x7F);   
-  particleSensor.setPulseAmplitudeIR(0x70);    // SEGURANÇA para não bater no teto
+  particleSensor.setPulseAmplitudeIR(0x70);    // Mantido para evitar saturação
   
   particleSensor.clearFIFO();
   

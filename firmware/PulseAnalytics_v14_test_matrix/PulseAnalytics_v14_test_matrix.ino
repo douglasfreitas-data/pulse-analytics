@@ -41,38 +41,39 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 MAX30105 particleSensor;
 
 // ============================================
-// MATRIZ DE CONFIGURAÇÕES PARA 800Hz
+// MATRIZ DE REFINAMENTO PARA 800Hz
 // ============================================
+// Base: Configuração v11 que funcionou (softReset + Session 18)
+// Objetivo: Encontrar o ótimo local variando IR e LED
+
 struct SensorConfig {
-  int pulseWidth;      // 69, 118, 215 (compatíveis com 800Hz)
-  int adcRange;        // 4096, 8192, 16384
-  byte ledBrightness;  // 0x00 - 0xFF
-  byte irAmplitude;    // 0x00 - 0xFF
-  byte redAmplitude;   // 0x00 - 0xFF
+  int pulseWidth;      // Fixo em 215 (melhor para 800Hz)
+  int adcRange;        // Fixo em 16384 (máximo range)
+  byte ledBrightness;  // Variável
+  byte irAmplitude;    // Variável
+  byte redAmplitude;   // Fixo em 0x7F
   const char* name;    // Nome para tag
 };
 
-// 12 configurações de teste
+// 12 configurações de refinamento
 const SensorConfig TEST_CONFIGS[] = {
-  // Testes com pulseWidth 69μs (15-bit ADC, mais rápido)
-  { 69, 4096,  0x7F, 0x7F, 0x7F, "T01_PW69_ADC4K" },
-  { 69, 8192,  0x7F, 0x7F, 0x7F, "T02_PW69_ADC8K" },
-  { 69, 16384, 0x7F, 0x7F, 0x7F, "T03_PW69_ADC16K" },
+  // Grupo 1: Variando IR Amplitude (LED fixo em 0x7F)
+  { 215, 16384, 0x7F, 0x60, 0x7F, "R01_IR60_LED7F" },   // IR baixo
+  { 215, 16384, 0x7F, 0x68, 0x7F, "R02_IR68_LED7F" },   // IR intermediário-
+  { 215, 16384, 0x7F, 0x70, 0x7F, "R03_IR70_LED7F" },   // ATUAL v11 (referência)
+  { 215, 16384, 0x7F, 0x78, 0x7F, "R04_IR78_LED7F" },   // IR intermediário+
+  { 215, 16384, 0x7F, 0x80, 0x7F, "R05_IR80_LED7F" },   // IR alto
   
-  // Testes com pulseWidth 118μs (16-bit ADC, equilíbrio)
-  { 118, 4096,  0x7F, 0x7F, 0x7F, "T04_PW118_ADC4K" },
-  { 118, 8192,  0x7F, 0x7F, 0x7F, "T05_PW118_ADC8K" },
-  { 118, 16384, 0x7F, 0x7F, 0x7F, "T06_PW118_ADC16K" },
+  // Grupo 2: Variando LED Brightness (IR fixo em 0x70)
+  { 215, 16384, 0x60, 0x70, 0x7F, "R06_IR70_LED60" },   // LED baixo
+  { 215, 16384, 0x70, 0x70, 0x7F, "R07_IR70_LED70" },   // LED médio
+  { 215, 16384, 0x90, 0x70, 0x7F, "R08_IR70_LED90" },   // LED alto
+  { 215, 16384, 0xA0, 0x70, 0x7F, "R09_IR70_LEDA0" },   // LED muito alto
   
-  // Testes com pulseWidth 215μs (17-bit ADC, máximo para 800Hz)
-  { 215, 4096,  0x7F, 0x7F, 0x7F, "T07_PW215_ADC4K" },
-  { 215, 8192,  0x7F, 0x7F, 0x7F, "T08_PW215_ADC8K" },
-  { 215, 16384, 0x7F, 0x7F, 0x7F, "T09_PW215_ADC16K" },
-  
-  // Variações de amplitude (baseadas na Session 18)
-  { 215, 16384, 0x7F, 0x70, 0x7F, "T10_Session18_Ref" },  // REFERÊNCIA!
-  { 215, 16384, 0xFF, 0x7F, 0x7F, "T11_LED_MAX" },
-  { 215, 16384, 0x50, 0x50, 0x50, "T12_LED_LOW" },
+  // Grupo 3: Combinações promissoras
+  { 215, 16384, 0x90, 0x68, 0x7F, "R10_IR68_LED90" },   // LED alto + IR baixo
+  { 215, 16384, 0x60, 0x78, 0x7F, "R11_IR78_LED60" },   // LED baixo + IR alto
+  { 215, 16384, 0x80, 0x75, 0x7F, "R12_IR75_LED80" },   // Equilíbrio otimizado
 };
 
 const int NUM_CONFIGS = 12;
@@ -736,8 +737,8 @@ void setup() {
   delay(500);  // Tempo para o sensor se recuperar
   Serial.println("Sensor resetado!");
   
-  // Aplicar config padrão (Session 18)
-  applySensorConfig(9);  // T10 = índice 9
+  // Aplicar config padrão (v11 que funcionou)
+  applySensorConfig(2);  // R03 = índice 2 (referência)
   
   Serial.println("\nSistema pronto!");
   Serial.println("Digite 'help' para ver comandos.\n");

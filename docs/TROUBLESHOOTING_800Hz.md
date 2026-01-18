@@ -22,75 +22,76 @@ Após uma série de atualizações no firmware do sensor MAX30102, a qualidade d
 
 ---
 
-## 🎯 Metodologia de Resolução
+## ✅ SOLUÇÃO ENCONTRADA: softReset()
 
-### Abordagem: Teste Sistemático
+O problema foi resolvido adicionando `particleSensor.softReset()` no setup do firmware!
 
-Quando não temos backup da configuração funcional, precisamos **redescobrir** os parâmetros ideais através de testes controlados.
+### O que aconteceu
+O sensor MAX30102 ficou com registradores internos "travados" após um travamento forçado (desconexão USB durante execução). O `softReset()` limpa esses registradores e restaura o sensor ao estado de fábrica.
 
-### Variáveis a Testar (Compatíveis com 800Hz)
+### Código da solução (v11)
+```cpp
+// Após particleSensor.begin()
+Serial.println("Executando softReset()...");
+particleSensor.softReset();
+delay(500);
+Serial.println("Sensor resetado!");
+```
 
-| Parâmetro | Valores Possíveis | Impacto |
-|-----------|-------------------|---------|
-| `pulseWidth` | 69, 118, 215 μs | Resolução ADC |
-| `adcRange` | 4096, 8192, 16384 | Faixa dinâmica |
-| `ledBrightness` | 0x50, 0x7F, 0xFF | Intensidade do LED |
-| `irAmplitude` | 0x50, 0x70, 0x7F | Potência do IR |
-
-> [!NOTE]
-> Para 800Hz, o `pulseWidth` máximo é **215μs**. Valores maiores (411μs) limitam a taxa a 400Hz.
+### Resultado
+- ✅ Sinal PPG restaurado com amplitude completa (0.0 - 1.0)
+- ✅ Picos bem definidos e íngremes
+- ✅ Dicrótico notch visível
+- ✅ Taxa real próxima de 800Hz
 
 ---
 
-## 🧪 Matriz de Testes Criada
+## 🧪 Fase 2: Matriz de Refinamento
 
-### Firmware v14 - Test Matrix
+Agora que o sinal básico funciona, criamos uma matriz para encontrar a configuração **ótima**.
 
-Criamos uma versão especial do firmware com 12 configurações pré-definidas:
+### Firmware v14 - Refinement Matrix
 
-```
-Teste 1-3:   pulseWidth 69μs   (menor resolução, mais rápido)
-Teste 4-6:   pulseWidth 118μs  (equilíbrio)
-Teste 7-12:  pulseWidth 215μs  (máxima resolução para 800Hz)
-```
+Parâmetros fixos (funcionaram bem):
+- `pulseWidth = 215` (máximo para 800Hz)
+- `adcRange = 16384` (máximo range)
+- `redAmplitude = 0x7F`
 
-### Configurações Detalhadas
+Parâmetros variáveis:
+- `irAmplitude`: 0x60 a 0x80
+- `ledBrightness`: 0x60 a 0xA0
 
-| # | Nome | PW | ADC | LED | IR |
-|---|------|-----|------|-----|-----|
-| 1 | T01_PW69_ADC4K | 69 | 4096 | 0x7F | 0x7F |
-| 2 | T02_PW69_ADC8K | 69 | 8192 | 0x7F | 0x7F |
-| 3 | T03_PW69_ADC16K | 69 | 16384 | 0x7F | 0x7F |
-| 4 | T04_PW118_ADC4K | 118 | 4096 | 0x7F | 0x7F |
-| 5 | T05_PW118_ADC8K | 118 | 8192 | 0x7F | 0x7F |
-| 6 | T06_PW118_ADC16K | 118 | 16384 | 0x7F | 0x7F |
-| 7 | T07_PW215_ADC4K | 215 | 4096 | 0x7F | 0x7F |
-| 8 | T08_PW215_ADC8K | 215 | 8192 | 0x7F | 0x7F |
-| 9 | T09_PW215_ADC16K | 215 | 16384 | 0x7F | 0x7F |
-| **10** | **T10_Session18_Ref** | **215** | **16384** | **0x7F** | **0x70** |
-| 11 | T11_LED_MAX | 215 | 16384 | 0xFF | 0x7F |
-| 12 | T12_LED_LOW | 215 | 16384 | 0x50 | 0x50 |
+### Configurações de Refinamento
+
+| # | Nome | LED | IR | Grupo |
+|---|------|-----|-----|-------|
+| 1 | R01_IR60_LED7F | 0x7F | 0x60 | IR baixo |
+| 2 | R02_IR68_LED7F | 0x7F | 0x68 | IR intermediário- |
+| **3** | **R03_IR70_LED7F** | **0x7F** | **0x70** | **REFERÊNCIA (v11)** |
+| 4 | R04_IR78_LED7F | 0x7F | 0x78 | IR intermediário+ |
+| 5 | R05_IR80_LED7F | 0x7F | 0x80 | IR alto |
+| 6 | R06_IR70_LED60 | 0x60 | 0x70 | LED baixo |
+| 7 | R07_IR70_LED70 | 0x70 | 0x70 | LED médio |
+| 8 | R08_IR70_LED90 | 0x90 | 0x70 | LED alto |
+| 9 | R09_IR70_LEDA0 | 0xA0 | 0x70 | LED muito alto |
+| 10 | R10_IR68_LED90 | 0x90 | 0x68 | LED alto + IR baixo |
+| 11 | R11_IR78_LED60 | 0x60 | 0x78 | LED baixo + IR alto |
+| 12 | R12_IR75_LED80 | 0x80 | 0x75 | Equilíbrio otimizado |
 
 > [!IMPORTANT]
-> O **Teste 10** replica a configuração presumida da Session 18 e serve como referência.
+> O **Teste R03** é a configuração atual do v11 e serve como baseline.
 
 ---
 
 ## 📊 Como Executar os Testes
 
-### 1. Flash do Firmware
-
-```bash
-# Compilar e enviar para o ESP32
-# Use Arduino IDE ou PlatformIO
-```
+### 1. Flash do Firmware v14
 
 ### 2. Comandos Disponíveis
 
 | Comando | Descrição |
 |---------|-----------|
 | `t1` a `t12` | Executar teste específico |
-| `test1` a `test12` | Mesmo que acima |
 | `auto` | Executar todos os 12 testes sequencialmente |
 | `configs` | Listar todas as configurações |
 | `retry` | Reenviar upload que falhou |
@@ -99,16 +100,16 @@ Teste 7-12:  pulseWidth 215μs  (máxima resolução para 800Hz)
 ### 3. Procedimento de Teste
 
 1. Conectar ESP32 via Serial (115200 baud)
-2. Digitar `auto` para executar todos os testes
-3. Manter o dedo no sensor durante cada coleta (10 segundos)
-4. Aguardar upload de cada teste
+2. Digitar `t3` para testar a referência primeiro
+3. Se OK, digitar `auto` para todos os testes
+4. Manter o dedo no sensor durante cada coleta (10 segundos)
 5. Verificar resultados no Supabase
 
 ---
 
 ## 📈 Análise dos Resultados
 
-### O que procurar em um bom sinal PPG
+### O que procurar
 
 ```
 Sinal BOM:                    Sinal RUIM:
@@ -118,72 +119,74 @@ Sinal BOM:                    Sinal RUIM:
                                
 - Picos claros                - Sem picos
 - Periodicidade visível       - Sinal plano
-- Amplitude consistente       - Saturação (teto)
+- Amplitude 0.0-1.0           - Saturação (teto)
 ```
 
 ### Critérios de Sucesso
 
-- [ ] Picos PPG visíveis e bem definidos
-- [ ] Taxa efetiva próxima de 800Hz
-- [ ] Sem saturação (valores não batendo em 65535)
-- [ ] Amplitude suficiente (não muito baixa)
+- [x] Picos PPG visíveis e bem definidos ✅ (resolvido com softReset)
+- [ ] Taxa efetiva = 800Hz
+- [ ] Sem saturação
+- [ ] Maior amplitude possível sem saturar
 
 ---
 
-## 📝 Registro de Resultados
+## 📝 Registro de Resultados (Refinamento)
 
-Preencha esta tabela após executar os testes:
-
-| Teste | Taxa Real | Amplitude | Picos Visíveis | Saturação | Nota |
-|-------|-----------|-----------|----------------|-----------|------|
-| T01 | Hz | | ☐ Sim ☐ Não | ☐ Sim ☐ Não | |
-| T02 | Hz | | ☐ Sim ☐ Não | ☐ Sim ☐ Não | |
-| T03 | Hz | | ☐ Sim ☐ Não | ☐ Sim ☐ Não | |
-| T04 | Hz | | ☐ Sim ☐ Não | ☐ Sim ☐ Não | |
-| T05 | Hz | | ☐ Sim ☐ Não | ☐ Sim ☐ Não | |
-| T06 | Hz | | ☐ Sim ☐ Não | ☐ Sim ☐ Não | |
-| T07 | Hz | | ☐ Sim ☐ Não | ☐ Sim ☐ Não | |
-| T08 | Hz | | ☐ Sim ☐ Não | ☐ Sim ☐ Não | |
-| T09 | Hz | | ☐ Sim ☐ Não | ☐ Sim ☐ Não | |
-| **T10** | Hz | | ☐ Sim ☐ Não | ☐ Sim ☐ Não | **Referência** |
-| T11 | Hz | | ☐ Sim ☐ Não | ☐ Sim ☐ Não | |
-| T12 | Hz | | ☐ Sim ☐ Não | ☐ Sim ☐ Não | |
+| Teste | Taxa Real | Amplitude | Picos | Saturação | Nota |
+|-------|-----------|-----------|-------|-----------|------|
+| R01 | Hz | | ☐ | ☐ | |
+| R02 | Hz | | ☐ | ☐ | |
+| **R03** | **Hz** | | ☐ | ☐ | **Referência** |
+| R04 | Hz | | ☐ | ☐ | |
+| R05 | Hz | | ☐ | ☐ | |
+| R06 | Hz | | ☐ | ☐ | |
+| R07 | Hz | | ☐ | ☐ | |
+| R08 | Hz | | ☐ | ☐ | |
+| R09 | Hz | | ☐ | ☐ | |
+| R10 | Hz | | ☐ | ☐ | |
+| R11 | Hz | | ☐ | ☐ | |
+| R12 | Hz | | ☐ | ☐ | |
 
 ---
 
-## 🏆 Configuração Ideal Encontrada
-
-*(Preencher após os testes)*
+## 🏆 Configuração Atual (v11 - Funcionando)
 
 ```cpp
-// CONFIGURAÇÃO IDEAL PARA 800Hz
-byte ledBrightness = ____;
+// CONFIGURAÇÃO FUNCIONAL PARA 800Hz
+byte ledBrightness = 0x7F;
 byte sampleAverage = 1;
 byte ledMode = 2;
 int sampleRate = 800;
-int pulseWidth = ____;
-int adcRange = ____;
+int pulseWidth = 215;
+int adcRange = 16384;
 
-particleSensor.setPulseAmplitudeRed(____);
-particleSensor.setPulseAmplitudeIR(____);
+particleSensor.setPulseAmplitudeRed(0x7F);
+particleSensor.setPulseAmplitudeIR(0x70);
+
+// IMPORTANTE: softReset() antes de configurar!
+particleSensor.softReset();
+delay(500);
 ```
 
 ---
 
 ## 💡 Lições Aprendidas
 
-1. **Versionamento é essencial** - Sempre commitar antes de experimentos
-2. **Documentar configurações** - Anotar parâmetros de sessões bem-sucedidas
-3. **Teste sistemático** - Quando perdido, criar matriz de testes controlados
-4. **Backups automáticos** - Considerar backup automático de configs funcionais
+1. **softReset() é essencial** - Sempre limpar o sensor após travamentos
+2. **Versionamento é essencial** - Sempre commitar antes de experimentos
+3. **Documentar configurações** - Anotar parâmetros de sessões bem-sucedidas
+4. **Teste sistemático** - Quando perdido, criar matriz de testes controlados
+5. **Backups automáticos** - Considerar backup automático de configs funcionais
 
 ---
 
 ## 🔗 Arquivos Relacionados
 
+- [Firmware v11 (funcionando)](file:///home/douglas/Documentos/Projects/PPG/pulse-analytics/firmware/PulseAnalytics_v11_800Hz/PulseAnalytics_v11_800Hz.ino)
 - [Firmware v14 Test Matrix](file:///home/douglas/Documentos/Projects/PPG/pulse-analytics/firmware/PulseAnalytics_v14_test_matrix/PulseAnalytics_v14_test_matrix.ino)
 - [Documentação do Sensor](file:///home/douglas/Documentos/Projects/PPG/pulse-analytics/docs/SENSOR_CONFIG_EXPLAINED.md)
 
 ---
 
-*Documento criado em 2026-01-17*
+*Documento atualizado em 2026-01-17*
