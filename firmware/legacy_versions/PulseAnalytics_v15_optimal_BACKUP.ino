@@ -1,4 +1,4 @@
- /**
+/**
  * ============================================
  * PULSE ANALYTICS v15.0 - OPTIMAL 800Hz
  * ============================================
@@ -620,7 +620,7 @@ void showWaitingScreen() {
   display.print("Sessoes: ");
   display.println(sessionNumber);
   display.setCursor(0, 54);
-  display.println("BTN or 'start'");
+  display.println("Serial: 'start'");
   display.display();
 }
 
@@ -732,9 +732,6 @@ void setup() {
   Serial.println("\nSistema pronto!");
   Serial.println("Digite 'start' para iniciar coleta.\n");
   
-  // Botão BOOT
-  pinMode(0, INPUT_PULLUP);
-  
   currentState = WAITING_BUTTON;
 }
 
@@ -746,25 +743,6 @@ void loop() {
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     processCommand(cmd);
-  }
-  
-  // Botão BOOT (GPIO 0) para iniciar manualmente
-  if (digitalRead(0) == LOW) {
-    delay(50); // Debounce
-    if (digitalRead(0) == LOW) {
-      if (currentState == WAITING_BUTTON) {
-        Serial.println("Botao BOOT pressionado!");
-        display.clearDisplay();
-        display.setTextSize(2);
-        display.setCursor(10, 20);
-        display.println("INICIANDO");
-        display.display();
-        delay(1000);
-        startCollection();
-      }
-      // Esperar soltar para não disparar multiplas vezes
-      while (digitalRead(0) == LOW) delay(10);
-    }
   }
   
   switch (currentState) {

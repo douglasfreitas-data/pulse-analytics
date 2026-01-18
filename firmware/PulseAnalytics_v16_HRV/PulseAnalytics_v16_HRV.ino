@@ -50,18 +50,19 @@ MAX30105 particleSensor;
 // CONFIGURAÇÕES v16.0 - HRV MODE
 // ============================================
 
-// Buffer para 300 segundos @ 200Hz = 60.000 amostras
-// RAM: 60k * 2ch * 2 bytes = 240KB (ESP32-S3 suporta)
-// Nota: Se precisar de mais heap, reduzir para IR only
-const int BUFFER_SIZE = 60000;
+// Buffer para 200 segundos @ 200Hz = 40.000 amostras
+// RAM: 40k * 2ch * 2 bytes = 160KB (seguro para ESP32-S3)
+// Nota: Para 5 minutos completos, seria necessário streaming ou só IR
+const int BUFFER_SIZE = 40000;
 uint16_t irBuffer[BUFFER_SIZE];
 uint16_t redBuffer[BUFFER_SIZE];
 int bufferIndex = 0;
 
-// Timing - MODO HRV
+// Timing - MODO HRV (3.3 minutos é suficiente para métricas básicas)
+// Para LF/HF ideal (5 min), usar modo IR-only no futuro
 const int SAMPLE_RATE_HZ = 200;           // Taxa otimizada para HRV
 const unsigned long SAMPLE_INTERVAL_US = 5000;  // 1000000 / 200 = 5000μs
-const unsigned long SAMPLE_DURATION_MS = 300000; // 5 minutos = 300 segundos
+const unsigned long SAMPLE_DURATION_MS = 200000; // 3.3 minutos = 200 segundos
 
 unsigned long sampleStartTime = 0;
 unsigned long bootTime = 0;
@@ -677,13 +678,14 @@ void setup() {
   // CONFIGURAÇÃO PARA HRV (200 Hz)
   // ============================================
   // Para HRV, não precisamos de alta resolução temporal.
-  // 200 Hz é mais que suficiente para detectar picos R.
-  // Usamos pulseWidth maior para melhor SNR.
+  // 200 Hz efetivo é suficiente para detectar picos R.
+  // Com sampleAverage=4, precisamos configurar 800Hz para ter 200Hz efetivo
+  // Taxa efetiva = sampleRate / sampleAverage = 800/4 = 200 Hz
   
   byte ledBrightness = 0x60;  // Moderado (economia de energia)
   byte sampleAverage = 4;     // Média de 4 amostras = menos ruído
   byte ledMode = 2;           // Red + IR
-  int sampleRate = 200;       // 200 Hz para HRV
+  int sampleRate = 800;       // 800 Hz / 4 = 200 Hz efetivo
   int pulseWidth = 411;       // Máximo SNR
   int adcRange = 16384;       // 16-bit
   
@@ -697,9 +699,9 @@ void setup() {
   
   Serial.println("Sensor configurado (HRV Mode):");
   Serial.print("  LED Mode: "); Serial.println(ledMode);
-  Serial.print("  Sample Rate: "); Serial.println(sampleRate);
-  Serial.print("  Pulse Width: "); Serial.println(pulseWidth);
+  Serial.print("  Sample Rate Config: "); Serial.println(sampleRate);
   Serial.print("  Sample Average: "); Serial.println(sampleAverage);
+  Serial.print("  Taxa Efetiva: "); Serial.print(sampleRate / sampleAverage); Serial.println(" Hz");
   Serial.println("\nSistema pronto!");
   Serial.println("Digite 'start' para iniciar MEU DIA (5 min).\n");
   
