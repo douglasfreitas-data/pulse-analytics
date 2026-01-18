@@ -37,3 +37,4 @@ env/
 # Project specific
 # Ignore raw data dumps if they are large, but easy to regenerate
 data_dumps/
+analytics/datasets/
