@@ -1,22 +1,21 @@
 /**
  * ============================================
- * PULSE ANALYTICS v8.0 - CLOUD STORAGE
+ * PULSE ANALYTICS v15.0 - OPTIMAL 800Hz
  * ============================================
  * 
- * SENSOR: MAX30102 (Red + IR apenas, sem Green)
- * FOCO: Coleta de alta frequência para análise offline
+ * VERSÃO ESTÁVEL OTIMIZADA
+ * Baseada nos resultados do Teste Matrix (R08 vencedor)
  * 
- * Configuração:
- * - LED Mode: 2 (Red + IR)
- * - Sample Rate: 400Hz
- * - Pulse Width: 69μs (15-bit ADC)
- * - Sample Average: 1 (sem média)
- * - I2C: 400kHz Fast Mode
+ * SENSOR: MAX30102 (Red + IR)
+ * TAXA: ~757 Hz real (800Hz configurado)
+ * LED: 0x90 (otimizado para melhor SNR)
+ * IR: 0x70 (evita saturação)
  * 
- * Estratégia:
- * - Buffer local para 300 segundos
- * - Upload único no final (mais seguro para WiFi instável)
- * - Sem cálculos de BPM/SpO2 (feito offline)
+ * MELHORIAS v15:
+ * - softReset() para limpar sensor
+ * - Taxa real salva no upload
+ * - Config R08 do Teste Matrix
+ * - Melhor entalhe dicrótico
  */
 
 #include <Wire.h>
@@ -174,7 +173,7 @@ void uploadRawData() {
   
   // JSON - Estrutura simplificada para v8.0
   sendChunk(client, "{");
-  sendChunk(client, "\"device_id\": \"ESP32-S3-v11-800Hz\",");
+  sendChunk(client, "\"device_id\": \"ESP32-S3-v15-Optimal\",");
   sendChunk(client, "\"user_name\": \"" + currentUserName + "\",");
   sendChunk(client, "\"sampling_rate_hz\": " + String((int)realSampleRate) + ",");
   sendChunk(client, "\"session_index\": " + String(sessionNumber) + ",");
@@ -428,7 +427,7 @@ void processCommand(String cmd) {
     Serial.print("Sexo: "); Serial.println(currentSessionGender);
   }
   else if (cmd.equalsIgnoreCase("status")) {
-    Serial.println("\n=== STATUS v8.0 ===");
+    Serial.println("\n=== STATUS v15.0 ===");
     Serial.print("Usuario: "); Serial.println(currentUserName);
     Serial.print("Sessoes: "); Serial.println(sessionNumber);
     Serial.print("Estado: "); Serial.println(currentState == WAITING_BUTTON ? "AGUARDANDO" : "COLETANDO");
@@ -438,7 +437,7 @@ void processCommand(String cmd) {
     Serial.println("===================\n");
   }
   else if (cmd.equalsIgnoreCase("help") || cmd.equalsIgnoreCase("h")) {
-    Serial.println("\n=== COMANDOS v8.0 ===");
+    Serial.println("\n=== COMANDOS v15.0 ===");
     Serial.println("start / s    - Iniciar coleta");
     Serial.println("c            - Resetar sessoes");
     Serial.println("l            - Ver log/status");
@@ -611,9 +610,9 @@ void showWaitingScreen() {
   display.clearDisplay();
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.println("PulseAnalytics v11.0");
+  display.println("PulseAnalytics v15.0");
   display.setCursor(0, 12);
-  display.println("800Hz RESTORED");
+  display.println("OPTIMAL 800Hz");
   display.setCursor(0, 28);
   display.print("User: ");
   display.println(currentUserName);
@@ -651,8 +650,9 @@ void setup() {
   WiFi.disconnect();
   
   Serial.println("\n============================================");
-  Serial.println("   PULSE ANALYTICS v11.0 - 800Hz RESTORED");
+  Serial.println("   PULSE ANALYTICS v15.0 - OPTIMAL 800Hz");
   Serial.println("   Sensor: MAX30102 (Red + IR) @ 800Hz");
+  Serial.println("   Config: R08 (Teste Matrix Winner)");
   Serial.println("============================================");
   Serial.println("Comandos: 'start', 'USER:nome', 'help'");
   Serial.println("============================================\n");
@@ -674,9 +674,9 @@ void setup() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 10);
-  display.println("PulseAnalytics v11");
+  display.println("PulseAnalytics v15");
   display.setCursor(0, 25);
-  display.println("800Hz RESTORED");
+  display.println("OPTIMAL 800Hz");
   display.setCursor(0, 40);
   display.println("Inicializando...");
   display.display();
