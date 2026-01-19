@@ -7,19 +7,20 @@
  * Coleta otimizada para análise de variabilidade cardíaca
  * 
  * SENSOR: MAX30102 (Red + IR)
- * TAXA: 125 Hz (1000Hz/8 averaging - máxima qualidade)
+ * TAXA: 200 Hz (otimizado para HRV)
  * DURAÇÃO: 5 minutos (300 segundos)
  * 
  * DIFERENÇAS DA v15 (Biomarcadores):
- * - Taxa reduzida: 125 Hz (vs 800 Hz) - coincide com MIMIC-II
+ * - Taxa reduzida: 200 Hz (vs 800 Hz)
  * - Duração maior: 5 min (vs 50s)
  * - Foco: Intervalos RR, não morfologia
- * - Buffer: 40.000 amostras (5 min @ 125Hz = 37.500)
- * - sampleAverage=8: máximo SNR (média de 8 leituras)
+ * - Buffer: 60.000 amostras (vs 40.000)
  * 
  * DECISÃO TÉCNICA:
- * 125 Hz escolhido para compatibilidade direta com MIMIC-II.
- * 8x averaging no hardware = sinal muito limpo.
+ * 200 Hz foi escolhido para compatibilidade com pipeline de ML
+ * que será treinado com datasets a 125-200 Hz.
+ * Treinamos na mesma frequência de produção para evitar
+ * overhead de decimação em real-time.
  * (Ver: docs/estrutura/V2 - DECISÃO DE FREQUÊNCIA.md)
  */
 
@@ -57,10 +58,11 @@ uint16_t irBuffer[BUFFER_SIZE];
 uint16_t redBuffer[BUFFER_SIZE];
 int bufferIndex = 0;
 
-// Timing - MODO HRV (125 Hz = 5 min = 37.500 amostras)
-const int SAMPLE_RATE_HZ = 125;           // Taxa efetiva (1000/8)
-const unsigned long SAMPLE_INTERVAL_US = 8000;  // 1000000 / 125 = 8000μs
-const unsigned long SAMPLE_DURATION_MS = 300000; // 5 minutos = 300 segundos
+// Timing - MODO HRV (3.3 minutos é suficiente para métricas básicas)
+// Para LF/HF ideal (5 min), usar modo IR-only no futuro
+const int SAMPLE_RATE_HZ = 200;           // Taxa otimizada para HRV
+const unsigned long SAMPLE_INTERVAL_US = 5000;  // 1000000 / 200 = 5000μs
+const unsigned long SAMPLE_DURATION_MS = 200000; // 3.3 minutos = 200 segundos
 
 unsigned long sampleStartTime = 0;
 unsigned long bootTime = 0;
@@ -673,33 +675,33 @@ void setup() {
   Serial.println("Sensor resetado!");
   
   // ============================================
-  // CONFIGURAÇÃO PARA HRV (125 Hz - MÁXIMA QUALIDADE)
+  // CONFIGURAÇÃO PARA HRV (200 Hz)
   // ============================================
-  // 1000 Hz com 8x averaging = 125 Hz efetivo (igual MIMIC-II)
-  // pulseWidth=118 permite 1000Hz, LED mais alto compensa
-  // 8x averaging = sinal muito limpo, ideal para detecção de picos
+  // Para HRV, não precisamos de alta resolução temporal.
+  // 200 Hz efetivo é suficiente para detectar picos R.
+  // Com sampleAverage=4, precisamos configurar 800Hz para ter 200Hz efetivo
+  // Taxa efetiva = sampleRate / sampleAverage = 800/4 = 200 Hz
   
-  byte ledBrightness = 0x80;  // Aumentado para compensar PW menor
-  byte sampleAverage = 8;     // 8x averaging = máximo SNR
+  byte ledBrightness = 0x60;  // Moderado (economia de energia)
+  byte sampleAverage = 4;     // Média de 4 amostras = menos ruído
   byte ledMode = 2;           // Red + IR
-  int sampleRate = 1000;      // 1000 Hz / 8 = 125 Hz efetivo
-  int pulseWidth = 118;       // Menor PW para permitir 1000Hz
+  int sampleRate = 800;       // 800 Hz / 4 = 200 Hz efetivo
+  int pulseWidth = 411;       // Máximo SNR
   int adcRange = 16384;       // 16-bit
   
   particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
   
-  // Amplitudes mais altas para compensar pulseWidth menor
-  particleSensor.setPulseAmplitudeRed(0x80);   
-  particleSensor.setPulseAmplitudeIR(0x80);
+  // Amplitudes moderadas (economia + qualidade)
+  particleSensor.setPulseAmplitudeRed(0x50);   
+  particleSensor.setPulseAmplitudeIR(0x50);
   
   particleSensor.clearFIFO();
   
-  Serial.println("Sensor configurado (HRV Mode - 125Hz):");
+  Serial.println("Sensor configurado (HRV Mode):");
   Serial.print("  LED Mode: "); Serial.println(ledMode);
   Serial.print("  Sample Rate Config: "); Serial.println(sampleRate);
   Serial.print("  Sample Average: "); Serial.println(sampleAverage);
   Serial.print("  Taxa Efetiva: "); Serial.print(sampleRate / sampleAverage); Serial.println(" Hz");
-  Serial.print("  Pulse Width: "); Serial.println(pulseWidth);
   Serial.println("\nSistema pronto!");
   Serial.println("Digite 'start' para iniciar MEU DIA (5 min).\n");
   
