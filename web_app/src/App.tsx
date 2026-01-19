@@ -84,8 +84,30 @@ function App() {
         const sampleRate = data.sampling_rate_hz || 800
         const metrics = analyzeWaveform(data.ir_waveform, sampleRate)
 
+        // Salvar métricas calculadas no Supabase
+        const { error: updateError } = await supabase
+          .from('hrv_sessions')
+          .update({
+            fc_mean: metrics.bpm,
+            sdnn: metrics.sdnn,
+            rmssd: metrics.rmssd,
+            pnn50: metrics.pnn50,
+            rr_valid_count: metrics.rrIntervals.length
+          })
+          .eq('id', session.id)
+
+        if (updateError) {
+          console.error('Erro ao salvar métricas:', updateError)
+        } else {
+          console.log('Métricas salvas no Supabase!')
+        }
+
         const updatedSession = {
           ...session,
+          fc_mean: metrics.bpm,
+          sdnn: metrics.sdnn,
+          rmssd: metrics.rmssd,
+          pnn50: metrics.pnn50,
           calculatedMetrics: metrics,
           isAnalyzing: false
         }
