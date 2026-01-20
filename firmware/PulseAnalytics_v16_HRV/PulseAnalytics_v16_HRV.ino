@@ -701,10 +701,7 @@ void setup() {
   Serial.print("  Taxa Efetiva: "); Serial.print(sampleRate / sampleAverage); Serial.println(" Hz");
   Serial.print("  Pulse Width: "); Serial.println(pulseWidth);
   Serial.println("\nSistema pronto!");
-  Serial.println("Digite 'start' ou pressione BOOT para iniciar MEU DIA (5 min).\n");
-  
-  // Botão BOOT (GPIO 0) para iniciar sem Serial
-  pinMode(0, INPUT_PULLUP);
+  Serial.println("Digite 'start' para iniciar MEU DIA (5 min).\n");
   
   currentState = WAITING_BUTTON;
 }
@@ -717,25 +714,6 @@ void loop() {
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     processCommand(cmd);
-  }
-  
-  // Botão BOOT (GPIO 0) para iniciar manualmente
-  if (digitalRead(0) == LOW) {
-    delay(50); // Debounce
-    if (digitalRead(0) == LOW) {
-      if (currentState == WAITING_BUTTON) {
-        Serial.println("Botao BOOT pressionado!");
-        display.clearDisplay();
-        display.setTextSize(2);
-        display.setCursor(10, 20);
-        display.println("INICIANDO");
-        display.display();
-        delay(1000);
-        startCollection();
-      }
-      // Esperar soltar para não disparar multiplas vezes
-      while (digitalRead(0) == LOW) delay(10);
-    }
   }
   
   switch (currentState) {
