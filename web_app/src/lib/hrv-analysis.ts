@@ -1,7 +1,11 @@
 /**
  * HRV Analysis Module
  * Calcula métricas de variabilidade cardíaca a partir de waveform PPG
+ * 
+ * v2.0 - Agora com pré-processamento wavelet para remoção de artefatos
  */
+
+import { preprocessPPG } from './signal-processing';
 
 export interface HRVMetrics {
     bpm: number;
@@ -148,8 +152,44 @@ export function calculateHRVMetrics(rrIntervals: number[]): Omit<HRVMetrics, 'pe
 
 /**
  * Analisa waveform completa e retorna métricas de HRV
+ * Agora com pré-processamento wavelet para melhor qualidade
  */
-export function analyzeWaveform(irWaveform: number[], sampleRate: number): HRVMetrics {
+export function analyzeWaveform(irWaveform: number[], sampleRate: number): HRVMetrics & {
+    signalQuality: number;
+    artifacts: Array<{ start: number, end: number }>;
+} {
+    // Pré-processar sinal (wavelet denoising + remoção de baseline)
+    const preprocessed = preprocessPPG(irWaveform, sampleRate);
+
+    // Detectar picos no sinal limpo
+    const peakIndices = detectPeaks(preprocessed.cleanSignal, sampleRate);
+
+    // Calcular intervalos RR (excluindo picos em regiões de artefato)
+    const cleanPeakIndices = peakIndices.filter(peakIdx => {
+        // Verificar se o pico está em uma região de artefato
+        for (const artifact of preprocessed.artifacts) {
+            if (peakIdx >= artifact.start && peakIdx <= artifact.end) {
+                return false;
+            }
+        }
+        return true;
+    });
+
+    const rrIntervals = calculateRRIntervals(cleanPeakIndices, sampleRate);
+    const metrics = calculateHRVMetrics(rrIntervals);
+
+    return {
+        ...metrics,
+        peakIndices: cleanPeakIndices,
+        signalQuality: preprocessed.signalQuality,
+        artifacts: preprocessed.artifacts
+    };
+}
+
+/**
+ * Versão legacy sem wavelet (para comparação ou fallback)
+ */
+export function analyzeWaveformLegacy(irWaveform: number[], sampleRate: number): HRVMetrics {
     const peakIndices = detectPeaks(irWaveform, sampleRate);
     const rrIntervals = calculateRRIntervals(peakIndices, sampleRate);
     const metrics = calculateHRVMetrics(rrIntervals);
