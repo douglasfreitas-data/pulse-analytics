@@ -8,13 +8,15 @@ Este documento rastreia as versões estáveis do firmware para evitar regressõe
 
 | Versão | Pasta | Propósito | Taxa | Duração | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| **v17.0** | `PulseAnalytics_v17_1khz` | **ML Dataset** - Coleta máxima resolução | 1000 Hz | 50s | **TESTE** |
 | **v16.0** | `PulseAnalytics_v16_HRV` | **"Meu Dia"** - Medição diária HRV | 200 Hz | 5 min | **ATIVO** |
-| **v15.0** | `PulseAnalytics_v15_optimal` | **"Check-up"** - Biomarcadores/Morfologia | 757 Hz | 50s | **ATIVO** |
+| **v15.2** | `PulseAnalytics_v15.2_reliable` | **"Check-up"** - Biomarcadores/Morfologia | 757 Hz | 50s | **ATIVO** |
 
 ### Quando usar cada versão:
 
+- **v17 (1kHz PSRAM)**: Validação de qualidade de sinal a 1000Hz vs 757Hz - EXPERIMENTAL
 - **v16 (HRV)**: Uso diário para medição de estresse, recuperação e balanço autonômico
-- **v15 (Biomarcadores)**: Uso semanal/mensal para análise de saúde vascular (RI, SI, APG)
+- **v15.2 (Biomarcadores)**: Uso semanal/mensal para análise de saúde vascular (RI, SI, APG)
 
 ---
 
@@ -22,7 +24,9 @@ Este documento rastreia as versões estáveis do firmware para evitar regressõe
 
 | Versão | Arquivo de Backup | Data | Status | Descrição |
 | :--- | :--- | :--- | :--- | :--- |
+| **v17.0** | `PulseAnalytics_v17_1khz` | 27/01/2026 | **TESTE** | 1000Hz PSRAM Mode. Buffers na PSRAM (60k). pulseWidth=118µs. Validação de qualidade. |
 | **v16.0** | `PulseAnalytics_v16_HRV` | 18/01/2026 | **PROD** | HRV Mode "Meu Dia". 200Hz x 5 min. Buffer 60k. |
+| **v15.2** | `PulseAnalytics_v15.2_reliable` | 26/01/2026 | **PROD** | Upload confiável. Reconexão WiFi forçada. |
 | **v15.0** | `PulseAnalytics_v15_optimal` | 17/01/2026 | **PROD** | Biomarcadores Mode. 757Hz x 50s. Config R08 (Matrix winner). |
 | **v14.0** | `PulseAnalytics_v14_test_matrix` | 17/01/2026 | *Teste* | Matriz de testes para encontrar config ótima. |
 | **v13.0** | `PulseAnalytics_v13_session18_replica` | 17/01/2026 | *Teste* | Réplica da sessão 18 (melhor sinal até então). |
